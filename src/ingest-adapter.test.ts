@@ -55,14 +55,13 @@ describe("makeHmacVerifier — constant-time HMAC (AD2)", () => {
 });
 
 describe("createInMemoryReplayCache (SEC Q3)", () => {
-  it("reports a sig as seen until its anchored expiry, then forgets it", () => {
+  it("checkAndRecord: true once (fresh), false on a repeat in the band, true again after expiry", () => {
     let t = 1000;
     const cache = createInMemoryReplayCache(() => t);
-    expect(cache.seen("sig-1")).toBe(false);
-    cache.record("sig-1", t + REPLAY_WINDOW_MS); // expiry anchored by the caller (sent_at + window)
-    expect(cache.seen("sig-1")).toBe(true);
+    expect(cache.checkAndRecord("sig-1", t + REPLAY_WINDOW_MS)).toBe(true); // fresh
+    expect(cache.checkAndRecord("sig-1", t + REPLAY_WINDOW_MS)).toBe(false); // replay within the band
     t += REPLAY_WINDOW_MS + 1; // past the anchored expiry
-    expect(cache.seen("sig-1")).toBe(false);
+    expect(cache.checkAndRecord("sig-1", t + REPLAY_WINDOW_MS)).toBe(true); // forgotten → fresh again
   });
 });
 
@@ -201,6 +200,14 @@ describe("createIngestHttpHandler — wrapper (AD1/AD3 + mapping)", () => {
     expect(res.status).toBe(202);
     expect(verifyAppCheckToken).toHaveBeenCalledWith("tok");
     expect(verifyHmac).not.toHaveBeenCalled();
+  });
+
+  it("F10: a stray App-Check header is IGNORED when App Check is unconfigured (HMAC still runs → 202)", async () => {
+    // deps() has no verifyAppCheckToken → App Check unconfigured. A stray header must not force the
+    // App-Check path (which would 401); the valid HMAC signature must still win.
+    const handler = createIngestHttpHandler(deps());
+    const res = await handler(http(sign(baseEnv), { headers: { "x-firebase-appcheck": "stray-token" }, ip: "203.0.113.7" }));
+    expect(res.status).toBe(202);
   });
 
   it("maps 429 with a Retry-After header", async () => {

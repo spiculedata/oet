@@ -35,7 +35,7 @@ function makeDeps(overrides: Partial<IngestDeps> = {}): IngestDeps {
     verifyHmac: () => true,
     verifyAppCheck: () => true,
     rateLimiter: { allow: () => true },
-    replayCache: { seen: () => false, record: () => {} },
+    replayCache: { checkAndRecord: () => true },
     deriveGeo: () => ({ country: "US", region: null }),
     bqInsert: vi.fn(),
     ...overrides,
@@ -46,18 +46,17 @@ function req(body: unknown, extra: Partial<IngestRequest> = {}): IngestRequest {
 }
 
 describe("endpoint — failed auth touches nothing downstream", () => {
-  it("a forged sig (HMAC fail) does NOT record a replay nonce, rate-limit, or write", async () => {
-    const record = vi.fn();
-    const seen = vi.fn(() => false);
+  it("a forged sig (HMAC fail) does NOT touch the replay nonce, rate-limit, or write", async () => {
+    const checkAndRecord = vi.fn(() => true);
     const allow = vi.fn(() => true);
     const bqInsert = vi.fn();
     const r = await handleIngest(
       req(validEnvelope),
-      makeDeps({ verifyHmac: () => false, replayCache: { seen, record }, rateLimiter: { allow }, bqInsert }),
+      makeDeps({ verifyHmac: () => false, replayCache: { checkAndRecord }, rateLimiter: { allow }, bqInsert }),
     );
     expect(r.status).toBe(401);
     // The security-critical one: a forged request must not be able to seed/poison the nonce cache.
-    expect(record).not.toHaveBeenCalled();
+    expect(checkAndRecord).not.toHaveBeenCalled();
     expect(allow).not.toHaveBeenCalled(); // auth precedes rate limiting
     expect(bqInsert).not.toHaveBeenCalled();
   });
@@ -96,16 +95,14 @@ describe("endpoint — consent opacity is total (C4/D1)", () => {
 
 describe("endpoint — App Check path & the replay-nonce gap (SEC AD3)", () => {
   it("[AD3] the App Check path does NOT consult the body-sig replay cache (adapter must add its own)", async () => {
-    const seen = vi.fn(() => false);
-    const record = vi.fn();
+    const checkAndRecord = vi.fn(() => true);
     const r = await handleIngest(
       req(validEnvelope, { appCheckToken: "tok" }),
-      makeDeps({ verifyAppCheck: () => true, replayCache: { seen, record } }),
+      makeDeps({ verifyAppCheck: () => true, replayCache: { checkAndRecord } }),
     );
     expect(r.status).toBe(202);
     // Documents the gap SEC flagged for 4c: App Check has no body nonce, so this path is replay-checked
     // only by whatever the adapter adds (AD3) — not here.
-    expect(seen).not.toHaveBeenCalled();
-    expect(record).not.toHaveBeenCalled();
+    expect(checkAndRecord).not.toHaveBeenCalled();
   });
 });

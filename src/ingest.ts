@@ -46,6 +46,7 @@ const ENVELOPE_400_REASONS = new Set([
   "invalid_client_id",
   "invalid_platform",
   "invalid_app_version",
+  "invalid_user_id",
   "invalid_sent_at",
   "batch_empty",
 ]);
@@ -61,19 +62,46 @@ export interface RateLimiter {
 }
 
 export interface ReplayCache {
-  /** true if this signature is still recorded (i.e. not yet past its expiry). May be async (shared store). */
-  seen(sig: string): boolean | Promise<boolean>;
   /**
-   * Record a signature, expiring at `expiresAtMs` (epoch ms). The endpoint anchors this to
-   * `sent_at + PAST_WINDOW` so a nonce lives exactly as long as the envelope could still be fresh —
-   * not a flat window from receive time (§5.4, closes the clock-ahead gap). May be async (shared store).
+   * ATOMICALLY check-and-record a signature in ONE operation (no seen→record TOCTOU): returns true if
+   * the sig was NOT already present — it is now recorded, expiring at `expiresAtMs` — and false if it
+   * was already present (a replay). The single op means two concurrent identical sigs (across instances
+   * on a shared store) can never both pass: exactly one is accepted (D-STORE-CAS / F-DSTORE-RACE).
+   * Expiry is anchored to `sent_at + PAST_WINDOW` (§5.4 — matches the fresh band, no clock-ahead gap).
+   * May be async (a shared Firestore/Redis store).
    */
-  record(sig: string, expiresAtMs: number): void | Promise<void>;
+  checkAndRecord(sig: string, expiresAtMs: number): boolean | Promise<boolean>;
+}
+
+export interface IpRateGate {
+  /**
+   * Cheap, NO-I/O, per-IP first-line flood shed (SEC F2). Runs BEFORE parse/HMAC/nonce so a flood —
+   * authenticated or not — is dropped at the door before it can spend CPU on parsing/crypto or touch
+   * the (shared) nonce store. Per-instance/in-memory is fine: it's defense-in-depth in front of the
+   * authoritative shared rate limiter, not a replacement for it.
+   */
+  allow(ip: string | undefined): boolean;
+}
+
+/**
+ * A PII-FREE structured security event (SEC F5). Carries ONLY the outcome, the HTTP status, and a
+ * COARSE reason category — NEVER client_id, user_id, IP, the sig/secret, or any body content. Lets
+ * ops alert on auth-failure / flood / replay spikes without the telemetry endpoint itself logging PII.
+ */
+export interface SecurityEvent {
+  outcome: "rejected";
+  status: number;
+  /** Coarse category: size_cap · ip_flood · rate_limited · auth_failed · stale · future · replay. */
+  reason: string;
 }
 
 export interface IngestDeps {
   /** Server-authoritative wall clock, epoch milliseconds. */
   now(): number;
+  /** Optional cheap pre-auth per-IP flood gate (F2). When omitted, no pre-gate runs. */
+  ipRateGate?: IpRateGate;
+  /** Optional PII-free security-event sink (F5). Fired on 413/429/401 outcomes. */
+  onSecurityEvent?: (event: SecurityEvent) => void;
   /** Permitted event names (§3); unknown names are dropped. */
   allowlist: ReadonlySet<string>;
   /** Recompute the §5.2 canonical HMAC and constant-time compare against body.sig (adapter owns the secret). */
@@ -112,9 +140,20 @@ export async function handleIngest(
   req: IngestRequest,
   deps: IngestDeps,
 ): Promise<IngestResponse> {
+  // F5: emit a PII-free security event, then return the opaque failure. Reason is a coarse category.
+  const reject = (status: number, code: string, reason: string): IngestResponse => {
+    deps.onSecurityEvent?.({ outcome: "rejected", status, reason });
+    return fail(status, code);
+  };
+
+  // 0. F2 — cheap pre-auth per-IP flood gate, FIRST: shed a flood before any parse/HMAC/nonce work.
+  if (deps.ipRateGate && !deps.ipRateGate.allow(req.ip)) {
+    return reject(429, "rate_limited", "ip_flood");
+  }
+
   // 1. C2 — size cap BEFORE parse (an oversized body is never parsed into objects).
   if (Buffer.byteLength(req.rawBody, "utf8") > MAX_BODY_BYTES) {
-    return fail(413, "payload_too_large");
+    return reject(413, "payload_too_large", "size_cap");
   }
 
   // 2. parse + EP1 — must be a JSON object (not array/scalar), checked before auth.
@@ -133,11 +172,11 @@ export async function handleIngest(
   let authenticated: boolean;
   if (req.appCheckToken !== undefined) {
     authenticated = deps.verifyAppCheck(req.appCheckToken);
-    if (!authenticated) return fail(401, "unauthorized");
+    if (!authenticated) return reject(401, "unauthorized", "auth_failed");
   } else {
     const sig = body.sig;
     if (typeof sig !== "string" || !deps.verifyHmac(body)) {
-      return fail(401, "unauthorized");
+      return reject(401, "unauthorized", "auth_failed");
     }
     // Replay FRESHNESS (§5.4) + nonce, on the signed `sent_at`. F-FRESH-FAILCLOSED (SEC): a missing/
     // malformed sent_at FAILS CLOSED here (400) — never skipped. The control must be self-contained:
@@ -146,17 +185,20 @@ export async function handleIngest(
     const sentAtMs = typeof body.sent_at === "string" ? Date.parse(body.sent_at) : NaN;
     if (Number.isNaN(sentAtMs)) return fail(400, "bad_request");
     const age = deps.now() - sentAtMs; // +past / −future
-    if (age > PAST_WINDOW_MS || age < -FUTURE_SKEW_MS) return fail(401, "unauthorized");
-    // Nonce: identical sig within the fresh band → replay. Anchor expiry to sent_at + PAST_WINDOW.
-    if (await deps.replayCache.seen(sig)) return fail(401, "unauthorized");
-    await deps.replayCache.record(sig, sentAtMs + PAST_WINDOW_MS);
+    if (age > PAST_WINDOW_MS || age < -FUTURE_SKEW_MS) {
+      return reject(401, "unauthorized", age > PAST_WINDOW_MS ? "stale" : "future");
+    }
+    // Nonce: one atomic check-and-record. false ⇒ this sig was already seen in the fresh band ⇒ replay.
+    if (!(await deps.replayCache.checkAndRecord(sig, sentAtMs + PAST_WINDOW_MS))) {
+      return reject(401, "unauthorized", "replay");
+    }
     authenticated = true;
   }
 
   // 4. C3 — rate limit per client_id + per IP (policy/fail-open-closed lives in the limiter).
   const clientId = typeof body.client_id === "string" ? body.client_id : "";
   if (!(await deps.rateLimiter.allow(clientId, req.ip, authenticated))) {
-    return fail(429, "rate_limited");
+    return reject(429, "rate_limited", "rate_limited");
   }
 
   // 5. C4 + D1 — consent gate BEFORE shape validation, so consent:false / absent / odd all return
@@ -166,7 +208,7 @@ export async function handleIngest(
   // 6. validate — shape, §2.3 field rules, §2.1 batch bounds, allowlist.
   const result = validateEnvelope(body, deps.allowlist);
   if (result.accepted.length === 0) {
-    if (result.rejected.includes("batch_too_large")) return fail(413, "payload_too_large");
+    if (result.rejected.includes("batch_too_large")) return reject(413, "payload_too_large", "batch_cap");
     if (result.rejected.some((r) => ENVELOPE_400_REASONS.has(r))) return fail(400, "bad_request");
     // All events dropped by field-rule/allowlist → opaque 202 (C4): a misconfigured client
     // can't tell an allowed event from a dropped one.

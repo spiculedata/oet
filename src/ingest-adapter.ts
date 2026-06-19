@@ -24,6 +24,7 @@ import {
   REPLAY_WINDOW_MS,
   type IngestDeps,
   type IngestRequest,
+  type IpRateGate,
   type RateLimiter,
   type ReplayCache,
 } from "./ingest.js";
@@ -59,24 +60,22 @@ export function makeHmacVerifier(getSecret: SecretLookup): IngestDeps["verifyHma
 }
 
 // ── replay nonce cache (SEC Q3) ──────────────────────────────────────────────
-/** In-memory sig nonce cache with a sliding TTL = the replay window. Production: a shared store. */
+/**
+ * In-memory sig nonce cache, single-instance only. `checkAndRecord` is atomic by virtue of JS's
+ * single-threaded run-to-completion: the get + set happen with no `await` between them, so two
+ * concurrent calls can't interleave. (Cross-instance correctness needs the shared store; D-STORE.)
+ */
 export function createInMemoryReplayCache(now: () => number): ReplayCache {
   const expiry = new Map<string, number>();
   return {
-    seen(sig) {
-      const exp = expiry.get(sig);
-      if (exp === undefined) return false;
-      if (exp <= now()) {
-        expiry.delete(sig);
-        return false;
-      }
-      return true;
-    },
-    record(sig, expiresAtMs) {
+    checkAndRecord(sig, expiresAtMs) {
       const t = now();
       // opportunistic eviction so the map can't grow unbounded
       for (const [k, exp] of expiry) if (exp <= t) expiry.delete(k);
+      const exp = expiry.get(sig);
+      if (exp !== undefined && exp > t) return false; // already present in the fresh band → replay
       expiry.set(sig, expiresAtMs);
+      return true; // newly recorded
     },
   };
 }
@@ -145,6 +144,40 @@ export function createInMemoryRateLimiter(
     /** Live count of tracked buckets — for tests/metrics to assert the map stays bounded. */
     bucketCount() {
       return buckets.size;
+    },
+  };
+}
+
+// ── F2: cheap pre-auth per-IP flood gate (no I/O, in-memory) ─────────────────
+/**
+ * A per-IP fixed-window gate, in-memory and sync — the cheap first line that runs before parse/HMAC/
+ * nonce. Self-evicts dead buckets (≤1×/window) so a rotating-IP flood can't grow the map unbounded
+ * (same memory-DoS guard as the main limiter). Defaults: 300 requests / 1 min per IP.
+ */
+export function createInMemoryIpRateGate(opts: {
+  now: () => number;
+  windowMs?: number;
+  perIp?: number;
+}): IpRateGate {
+  const windowMs = opts.windowMs ?? 60 * 1000;
+  const perIp = opts.perIp ?? 300;
+  const buckets = new Map<string, { count: number; start: number }>();
+  let lastSweep = opts.now();
+  return {
+    allow(ip) {
+      const t = opts.now();
+      if (t - lastSweep >= windowMs) {
+        lastSweep = t;
+        for (const [k, b] of buckets) if (t - b.start >= windowMs) buckets.delete(k);
+      }
+      const key = ip ?? "?";
+      let b = buckets.get(key);
+      if (!b || t - b.start >= windowMs) {
+        b = { count: 0, start: t };
+        buckets.set(key, b);
+      }
+      b.count++;
+      return b.count <= perIp;
     },
   };
 }
@@ -264,7 +297,10 @@ export function createIngestHttpHandler(deps: AdapterDeps) {
       return jsonResult(413, { error: "payload_too_large" });
     }
 
-    const token = httpReq.headers[appCheckHeader];
+    // F10: only treat the App Check header as a token when App Check is CONFIGURED. Otherwise a stray
+    // `x-firebase-appcheck` header would force the (unverifiable) App-Check path → 401, blocking a
+    // perfectly valid HMAC request. Unconfigured ⇒ ignore the header entirely and let HMAC run.
+    const token = deps.verifyAppCheckToken ? httpReq.headers[appCheckHeader] : undefined;
     let appCheckResult = false;
     if (token !== undefined && deps.verifyAppCheckToken) {
       appCheckResult = await deps.verifyAppCheckToken(token);

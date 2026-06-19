@@ -13,15 +13,19 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { defineSecret } from "firebase-functions/params";
 import { BigQuery } from "@google-cloud/bigquery";
+import { initializeApp } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
 import {
   createIngestHttpHandler,
   makeHmacVerifier,
-  createInMemoryRateLimiter,
-  createInMemoryReplayCache,
+  createSharedRateLimiter,
+  createSharedReplayCache,
+  createInMemoryIpRateGate,
   createCoarseGeo,
   makeBqInsert,
   DEFAULT_ALLOWLIST,
 } from "oet";
+import { createFirestoreSharedStore } from "./firestore-store.js";
 
 const OET_HMAC_SECRET = defineSecret("OET_HMAC_SECRET");
 const DATASET = process.env.OET_DATASET ?? "oet";
@@ -30,14 +34,16 @@ const TABLE = process.env.OET_TABLE ?? "oet_events";
 const bq = new BigQuery();
 const now = (): number => Date.now();
 
-// Limiter + replay nonce cache. These in-memory impls are correct ONLY on a single instance — with
-// >1 instance the limit is enforced ~N× too weakly and a nonce on one instance is invisible to the
-// others (D-STORE). We therefore pin maxInstances=1 below for the locked-down phase. Before opening to
-// public (`allUsers`) traffic, swap these for the SHARED-store impls — createSharedRateLimiter /
-// createSharedReplayCache from the `oet` package over a Firestore-backed SharedStore — which lifts the
-// single-instance cap. (Shared-store wiring needs firebase-admin Firestore → applied at the real deploy.)
-const rateLimiter = createInMemoryRateLimiter({ now });
-const replayCache = createInMemoryReplayCache(now);
+// Limiter + replay nonce cache over a SHARED Firestore store, so they're correct across >1 instance
+// (D-STORE) AND race-free (atomic claim/transaction; D-STORE-CAS). This is what makes raising
+// maxInstances > 1 safe — see below. The Firestore TTL policy on `expiresAt` (deploy/RUNBOOK.md) reaps
+// expired nonce/counter docs; correctness comes from the in-transaction expiry check, not the reaper.
+initializeApp();
+const sharedStore = createFirestoreSharedStore(getFirestore());
+const rateLimiter = createSharedRateLimiter(sharedStore, { now });
+const replayCache = createSharedReplayCache(sharedStore);
+// F2: cheap per-instance, no-I/O pre-auth flood gate in front of all the above.
+const ipRateGate = createInMemoryIpRateGate({ now });
 
 const bqInsert = makeBqInsert({
   insertRows: async (rows, insertIds) => {
@@ -58,8 +64,12 @@ function getHandler(): ReturnType<typeof createIngestHttpHandler> {
     now,
     allowlist: DEFAULT_ALLOWLIST,
     verifyHmac: makeHmacVerifier(() => OET_HMAC_SECRET.value()),
+    ipRateGate,
     rateLimiter,
     replayCache,
+    // F5: PII-free structured security log (the event carries only outcome/status/coarse reason —
+    // never client_id/user_id/IP/secret/body). Cloud Logging ingests the JSON for alerting.
+    onSecurityEvent: (e) => console.warn(JSON.stringify({ severity: "WARNING", component: "oet-ingest", ...e })),
     // No IP→country provider wired yet → geo stays null (gaps stay gaps, DOMAIN LAW 6). Add a coarse
     // geo provider (country-only, EC1) before geo columns are populated.
     deriveGeo: createCoarseGeo({ lookupCountry: () => null }),
@@ -72,9 +82,8 @@ export const ingest = onRequest(
   {
     region: process.env.OET_REGION ?? "us-central1",
     secrets: [OET_HMAC_SECRET],
-    invoker: "private", // locked down — see file header
-    maxInstances: 1, // D-STORE: in-memory limiter/nonce are single-instance-correct only. Raise once
-    // the shared-store impls (createSharedRateLimiter/createSharedReplayCache) are wired (before public traffic).
+    invoker: "private", // locked down — open to `allUsers` only when the Owner is ready for public traffic
+    maxInstances: 10, // safe now: limiter + replay nonce are on the SHARED Firestore store (D-STORE/-CAS)
     memory: "256MiB",
   },
   async (req, res) => {

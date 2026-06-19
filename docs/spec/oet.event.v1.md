@@ -218,6 +218,12 @@ together with an existing first-party GA4 export — existing dashboards keep wo
 Provenance (`oet_ingest_version`) is stamped on every row so OET-sourced data is always
 distinguishable from first-party export downstream.
 
+> **Security note (F8 — untrusted `event_params`).** `event_params` keys/values are CLIENT-SUPPLIED and
+> only shape/PII-validated by the endpoint — they are **not** sanitized for downstream consumers. A
+> consumer that exports rows to CSV/TSV/spreadsheet MUST guard against **formula injection**: a value
+> beginning with `=`, `+`, `-`, `@`, or a tab/CR must be neutralized (e.g. prefix with `'`) before it
+> reaches a spreadsheet, or it may execute as a formula. Treat all `event_params` content as untrusted.
+
 ---
 
 ## 9. Open questions for the SEC gate

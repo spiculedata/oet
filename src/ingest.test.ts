@@ -29,7 +29,7 @@ function makeDeps(overrides: Partial<IngestDeps> = {}): IngestDeps {
     verifyHmac: () => true,
     verifyAppCheck: () => true,
     rateLimiter: { allow: () => true },
-    replayCache: { seen: () => false, record: () => {} },
+    replayCache: { checkAndRecord: () => true },
     deriveGeo: () => ({ country: "US", region: null }),
     bqInsert: vi.fn(),
     ...overrides,
@@ -93,17 +93,17 @@ describe("handleIngest — authenticity (C5) fails closed", () => {
   });
 });
 
-describe("handleIngest — replay nonce cache (SEC Q3)", () => {
-  it("401 when the signature was already seen in the window", async () => {
-    const r = await handleIngest(req(validEnvelope), makeDeps({ replayCache: { seen: () => true, record: () => {} } }));
+describe("handleIngest — replay nonce cache (SEC Q3 / D-STORE-CAS)", () => {
+  it("401 when checkAndRecord reports the sig was already seen (replay)", async () => {
+    const r = await handleIngest(req(validEnvelope), makeDeps({ replayCache: { checkAndRecord: () => false } }));
     expect(r.status).toBe(401);
   });
 
-  it("records the signature on a fresh request, with expiry anchored to sent_at + PAST_WINDOW", async () => {
-    const record = vi.fn();
-    const r = await handleIngest(req(validEnvelope), makeDeps({ replayCache: { seen: () => false, record } }));
+  it("atomically check-and-records on a fresh request, expiry anchored to sent_at + PAST_WINDOW", async () => {
+    const checkAndRecord = vi.fn(() => true);
+    const r = await handleIngest(req(validEnvelope), makeDeps({ replayCache: { checkAndRecord } }));
     expect(r.status).toBe(202);
-    expect(record).toHaveBeenCalledWith("hmac-sha256:abc", Date.parse(validEnvelope.sent_at) + PAST_WINDOW_MS);
+    expect(checkAndRecord).toHaveBeenCalledWith("hmac-sha256:abc", Date.parse(validEnvelope.sent_at) + PAST_WINDOW_MS);
   });
 });
 
@@ -130,6 +130,66 @@ describe("handleIngest — replay freshness (§5.4, signed sent_at)", () => {
   });
   it("400 when sent_at is present but not ISO-8601", async () => {
     expect((await handleIngest(req({ ...validEnvelope, sent_at: "yesterday" }), makeDeps())).status).toBe(400);
+  });
+});
+
+describe("handleIngest — pre-auth IP flood gate (SEC F2)", () => {
+  it("a blocked IP → 429 BEFORE any parse/HMAC/nonce work", async () => {
+    const verifyHmac = vi.fn(() => true);
+    const checkAndRecord = vi.fn(() => true);
+    const r = await handleIngest(
+      req(validEnvelope),
+      makeDeps({ ipRateGate: { allow: () => false }, verifyHmac, replayCache: { checkAndRecord } }),
+    );
+    expect(r.status).toBe(429);
+    expect(verifyHmac).not.toHaveBeenCalled(); // shed before HMAC
+    expect(checkAndRecord).not.toHaveBeenCalled(); // and before the nonce store
+  });
+
+  it("an allowed IP passes the gate through to 202", async () => {
+    const r = await handleIngest(req(validEnvelope), makeDeps({ ipRateGate: { allow: () => true } }));
+    expect(r.status).toBe(202);
+  });
+});
+
+describe("handleIngest — PII-free security events (SEC F5)", () => {
+  function assertPiiFree(e: object) {
+    // 1) only the 3 declared fields — no PII field can ride along.
+    expect(Object.keys(e).sort()).toEqual(["outcome", "reason", "status"]);
+    // 2) none of the actual PII/secret VALUES from the fixtures appear anywhere.
+    const json = JSON.stringify(e);
+    for (const v of ["win-3f2a", "203.0.113.7", "hmac-sha256:abc"]) {
+      expect(json, `security event leaked ${v}`).not.toContain(v);
+    }
+  }
+
+  it("fires a coarse, PII-free event on each security rejection (413/429/401/replay)", async () => {
+    const events: object[] = [];
+    const deps = () => makeDeps({ onSecurityEvent: (e) => events.push(e) });
+
+    // 413 size cap
+    await handleIngest({ rawBody: "x".repeat(MAX_BODY_BYTES + 1), ip: "203.0.113.7" }, deps());
+    // 429 IP flood
+    await handleIngest(req(validEnvelope), makeDeps({ onSecurityEvent: (e) => events.push(e), ipRateGate: { allow: () => false } }));
+    // 401 auth fail
+    await handleIngest(req(validEnvelope), makeDeps({ onSecurityEvent: (e) => events.push(e), verifyHmac: () => false }));
+    // 401 replay
+    await handleIngest(req(validEnvelope), makeDeps({ onSecurityEvent: (e) => events.push(e), replayCache: { checkAndRecord: () => false } }));
+    // 429 rate limited
+    await handleIngest(req(validEnvelope), makeDeps({ onSecurityEvent: (e) => events.push(e), rateLimiter: { allow: () => false } }));
+
+    const reasons = events.map((e) => (e as { reason: string }).reason);
+    expect(reasons).toEqual(["size_cap", "ip_flood", "auth_failed", "replay", "rate_limited"]);
+    for (const e of events) {
+      expect((e as { outcome: string }).outcome).toBe("rejected");
+      assertPiiFree(e);
+    }
+  });
+
+  it("does NOT fire on a successful 202", async () => {
+    const events: object[] = [];
+    await handleIngest(req(validEnvelope), makeDeps({ onSecurityEvent: (e) => events.push(e) }));
+    expect(events).toHaveLength(0);
   });
 });
 

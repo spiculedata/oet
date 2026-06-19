@@ -124,7 +124,7 @@ function httpDeps(over: Partial<AdapterDeps> = {}): AdapterDeps {
     allowlist: DEFAULT_ALLOWLIST,
     verifyHmac: () => true,
     rateLimiter: { allow: () => true },
-    replayCache: { seen: () => false, record: () => {} },
+    replayCache: { checkAndRecord: () => true },
     deriveGeo: () => ({ country: "US", region: null }),
     bqInsert: vi.fn(),
     ...over,

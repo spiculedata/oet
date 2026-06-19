@@ -19,10 +19,12 @@ import type { RateLimiter, ReplayCache } from "./ingest.js";
 export interface SharedStore {
   /** Atomically +1 the counter at `key` (creating it; the slot expires after `ttlMs`) → the new total. */
   increment(key: string, ttlMs: number): Promise<number>;
-  /** True if `key` is currently present (not past its expiry). */
-  has(key: string): Promise<boolean>;
-  /** Set `key`, expiring at `expiresAtMs` (epoch ms). */
-  set(key: string, expiresAtMs: number): Promise<void>;
+  /**
+   * ATOMICALLY claim `key`: true if it was newly created (not present), false if it already existed.
+   * Expires at `expiresAtMs`. The Firestore impl is a document `create` (fail-if-exists) — a single
+   * atomic op, so two concurrent claims of the same key resolve to exactly one `true` (D-STORE-CAS).
+   */
+  claim(key: string, expiresAtMs: number): Promise<boolean>;
 }
 
 export interface SharedRateLimitOptions {
@@ -66,16 +68,13 @@ export function createSharedRateLimiter(
 }
 
 /**
- * Replay nonce cache over the SHARED store: `seen` = `has`, `record` = `set`. This makes the nonce
- * cross-instance correct — a sig recorded by any instance is visible to all (closing SEC's D-STORE
- * gap). RESIDUAL: the seen→record flow is two ops, so two instances could `seen()` the same fresh sig
- * simultaneously before either `record`s it (a single duplicate slips through). Bounded and benign vs.
- * the cross-instance break it replaces; an atomic single-op `checkAndRecord` is the strict follow-up
- * (an endpoint-interface change — flagged for SEC, not in this slice).
+ * Replay nonce cache over the SHARED store: `checkAndRecord` = the store's atomic `claim`. Cross-
+ * instance correct AND race-free — two instances claiming the same fresh sig concurrently resolve to
+ * exactly one `true` (the other gets `false` → 401). Closes both SEC's cross-instance gap (D-STORE)
+ * and the seen→record TOCTOU (D-STORE-CAS).
  */
 export function createSharedReplayCache(store: SharedStore): ReplayCache {
   return {
-    seen: (sig) => store.has(`nonce:${sig}`),
-    record: (sig, expiresAtMs) => store.set(`nonce:${sig}`, expiresAtMs),
+    checkAndRecord: (sig, expiresAtMs) => store.claim(`nonce:${sig}`, expiresAtMs),
   };
 }

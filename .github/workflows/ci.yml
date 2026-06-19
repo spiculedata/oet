@@ -6,10 +6,16 @@ on:
   pull_request:
     branches: [development, main]
 
+# F9: least-privilege GITHUB_TOKEN — a compromised action can't write to the repo.
+permissions:
+  contents: read
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
+      # F9 follow-up: pin these to a verified commit SHA (`@<sha>`) to defend against tag mutation.
+      # Left on the major tag to avoid committing an unverified SHA; resolve at the next CI touch.
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:

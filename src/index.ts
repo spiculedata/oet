@@ -26,11 +26,14 @@ export type {
   IngestResponse,
   RateLimiter,
   ReplayCache,
+  IpRateGate,
+  SecurityEvent,
 } from "./ingest.js";
 export {
   makeHmacVerifier,
   createInMemoryReplayCache,
   createInMemoryRateLimiter,
+  createInMemoryIpRateGate,
   createCoarseGeo,
   makeBqInsert,
   rowInsertId,

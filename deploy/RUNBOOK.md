@@ -1,9 +1,10 @@
 # OET — GCP deploy runbook (Cloud Functions + BigQuery)
 
-Target project: **`oet-telemetry`** — a **placeholder for a standalone OET GCP project** (OET is a
-vendor-neutral protocol; it is NOT co-tenanted in any app's project). Replace it in `.firebaserc` with your
-own OET project ID before deploying. Endpoint deploys as the isolated **`oet`** functions codebase; data
-lands in the dedicated **`oet.oet_events`** BigQuery dataset.
+Target project: **`oet-telemetry`** — a **standalone OET GCP project** (OET is a vendor-neutral protocol;
+it is NOT co-tenanted in any app's project). **The project already exists** (created empty, no billing yet);
+`.firebaserc` points at it. Endpoint deploys as the isolated **`oet`** functions codebase; data lands in the
+dedicated **`oet.oet_events`** BigQuery dataset; rate-limit + replay state live in **Firestore** (`oet_nonces`
+/ `oet_counters`) so the function is correct across instances.
 
 > **Locked-down by design.** The function deploys `invoker: "private"` — only IAM-authenticated callers,
 > NOT the public internet. It is opened to unauthenticated public traffic ONLY after the **C8/SP1
@@ -28,10 +29,22 @@ node deploy/smoke.mjs      # emitter → endpoint → (logged) BQ; HMAC 401, con
    firebase login
    gcloud config set project oet-telemetry
    ```
-2. **Confirm billing** is enabled on `oet-telemetry` (Cloud Functions gen2 + BigQuery are billed).
+2. **Link billing + enable APIs** (Cloud Functions gen2, BigQuery, Firestore are billed):
+   ```
+   gcloud billing projects link oet-telemetry --billing-account=<YOUR_BILLING_ACCOUNT>
+   gcloud services enable cloudfunctions cloudbuild run artifactregistry eventarc \
+     bigquery secretmanager firestore logging pubsub --project=oet-telemetry
+   ```
 3. **Create the BigQuery dataset + table** (idempotent):
    ```
    bash deploy/bq-setup.sh oet-telemetry US
+   ```
+3b. **Create the Firestore database + TTL policies** (shared rate-limit/replay store):
+   ```
+   gcloud firestore databases create --location=nam5 --project=oet-telemetry   # once
+   # TTL policies so expired nonce/counter docs self-delete (correctness is in-txn; TTL reclaims storage):
+   gcloud firestore fields ttls update expiresAt --collection-group=oet_nonces   --enable-ttl --project=oet-telemetry
+   gcloud firestore fields ttls update expiresAt --collection-group=oet_counters --enable-ttl --project=oet-telemetry
    ```
 4. **Set the HMAC secret** (per-app shared secret the emitter signs with; never in source):
    ```
@@ -78,8 +91,9 @@ firebase functions:delete oet:ingest --region us-central1
   region behind a k-anon floor — EC1) before relying on geo.
 - **App Check**: only HMAC is wired here. App Check (Firebase clients) is a follow-up using
   `firebase-admin` `appCheck().verifyToken` injected as `verifyAppCheckToken`.
-- **Rate limiter / replay cache** are in-memory (per warm instance). For multi-instance correctness at
-  scale, back them with a shared store (Firestore/Redis) — fine for the locked-down validation phase.
+- **Rate limiter / replay cache** are now backed by the **shared Firestore store** (`functions/src/firestore-store.ts`)
+  — atomic `claim`/transaction, correct + race-free across instances (D-STORE / D-STORE-CAS), so the function
+  runs at `maxInstances: 10`. Needs the Firestore database + TTL policies from step 3b.
 - **Secret distribution**: `OET_HMAC_SECRET` is a single shared secret here. Per SEC ruling #1 / C9, a
   shipped untrusted client must NOT embed a global secret — use per-install provisioned keys or App Check
   before any real client ships with it.

@@ -106,6 +106,22 @@ describe("validateEnvelope — envelope field rules (§2.3 → 400)", () => {
     const r = validateEnvelope({ ...base, app_version: "9".repeat(65) }, DEFAULT_ALLOWLIST);
     expect(r.rejected).toContain("invalid_app_version");
   });
+
+  it("rejects an email-shaped user_id → invalid_user_id (PII guard, SEC F3)", () => {
+    const r = validateEnvelope({ ...base, user_id: "alice@example.com" }, DEFAULT_ALLOWLIST);
+    expect(r.ok).toBe(false);
+    expect(r.rejected).toContain("invalid_user_id");
+  });
+
+  it("rejects a user_id over 128 chars → invalid_user_id", () => {
+    const r = validateEnvelope({ ...base, user_id: "u".repeat(129) }, DEFAULT_ALLOWLIST);
+    expect(r.rejected).toContain("invalid_user_id");
+  });
+
+  it("accepts a valid opaque user_id (and null)", () => {
+    expect(validateEnvelope({ ...base, user_id: "u_9f2a-opaque" }, DEFAULT_ALLOWLIST).ok).toBe(true);
+    expect(validateEnvelope({ ...base, user_id: null }, DEFAULT_ALLOWLIST).ok).toBe(true);
+  });
 });
 
 describe("validateEnvelope — batch bounds (§2.1)", () => {

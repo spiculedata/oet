@@ -21,12 +21,11 @@ function fakeStore(now: () => number): SharedStore {
       counters.set(key, c);
       return c.n;
     },
-    async has(key) {
+    async claim(key, expiresAtMs) {
       const exp = nonces.get(key);
-      return exp !== undefined && exp > now();
-    },
-    async set(key, expiresAtMs) {
+      if (exp !== undefined && exp > now()) return false; // already claimed (present) → not fresh
       nonces.set(key, expiresAtMs);
+      return true; // newly claimed
     },
   };
 }
@@ -54,8 +53,7 @@ describe("createSharedRateLimiter — one budget across instances (D-STORE)", ()
   it("on store outage: unauth fails CLOSED, auth fails OPEN", async () => {
     const broken: SharedStore = {
       increment: async () => { throw new Error("firestore down"); },
-      has: async () => false,
-      set: async () => {},
+      claim: async () => true,
     };
     const rl = createSharedRateLimiter(broken, { now: () => 0 });
     expect(await rl.allow("c1", "ip1", false)).toBe(false); // unauth → closed
@@ -63,16 +61,26 @@ describe("createSharedRateLimiter — one budget across instances (D-STORE)", ()
   });
 });
 
-describe("createSharedReplayCache — nonce visible across instances (D-STORE)", () => {
-  it("a sig recorded by one instance is seen by another", async () => {
+describe("createSharedReplayCache — atomic + cross-instance (D-STORE / D-STORE-CAS)", () => {
+  it("a sig claimed by one instance is a replay for another (cross-instance), and expires", async () => {
     let t = 1000;
     const store = fakeStore(() => t);
     const a = createSharedReplayCache(store);
     const b = createSharedReplayCache(store);
-    expect(await b.seen("sig-1")).toBe(false);
-    await a.record("sig-1", t + 5 * 60 * 1000); // instance A records
-    expect(await b.seen("sig-1")).toBe(true); // instance B sees it — cross-instance correct
+    expect(await a.checkAndRecord("sig-1", t + 5 * 60 * 1000)).toBe(true); // instance A: fresh
+    expect(await b.checkAndRecord("sig-1", t + 5 * 60 * 1000)).toBe(false); // instance B: replay
     t += 5 * 60 * 1000 + 1; // past the anchored expiry
-    expect(await b.seen("sig-1")).toBe(false);
+    expect(await b.checkAndRecord("sig-1", t + 5 * 60 * 1000)).toBe(true); // forgotten → fresh again
+  });
+
+  it("D-STORE-CAS: two concurrent identical-sig claims across instances ⇒ EXACTLY ONE accepted", async () => {
+    const store = fakeStore(() => 0);
+    const a = createSharedReplayCache(store);
+    const b = createSharedReplayCache(store);
+    const [ra, rb] = await Promise.all([
+      a.checkAndRecord("sig-X", 5 * 60 * 1000),
+      b.checkAndRecord("sig-X", 5 * 60 * 1000),
+    ]);
+    expect([ra, rb].filter(Boolean)).toHaveLength(1); // no double-accept (closes F-DSTORE-RACE)
   });
 });

@@ -39,6 +39,8 @@ export const MAX_APP_VERSION_LEN = 64;
 export const MAX_EVENT_NAME_LEN = 64;
 export const MAX_PARAM_KEYS = 25;
 export const MAX_PARAM_KEY_LEN = 40;
+/** §2.3 (SEC F3): user_id, when present, is an opaque app id — bounded length, never an email. */
+export const MAX_USER_ID_LEN = 128;
 /** §2.3 (v0.1.1, N1): cap a string param VALUE to bound per-row cost. Non-strings are length-free. */
 export const MAX_PARAM_VALUE_LEN = 1024;
 
@@ -116,6 +118,11 @@ function checkEnvelopeFields(env: OetEnvelope): string | null {
   if (!REGISTERED_PLATFORMS.has(env.platform)) return "invalid_platform";
   if (env.app_version.length < 1 || env.app_version.length > MAX_APP_VERSION_LEN)
     return "invalid_app_version";
+  // §2.3 / SEC F3: user_id (when non-null) is an OPAQUE app id — bound its length and reject
+  // anything email-shaped (`@`), so a client can't smuggle PII (an email/account name) into the
+  // warehouse via user_id (DOMAIN LAW 1). null (anonymous) is always fine.
+  if (env.user_id !== null && (env.user_id.length > MAX_USER_ID_LEN || env.user_id.includes("@")))
+    return "invalid_user_id";
   // §5.5: sent_at must be a real ISO-8601+tz instant. A malformed time is a bad envelope (400);
   // a well-formed-but-stale/future time is the endpoint's freshness concern (401), not here.
   if (!ISO8601_TZ_RE.test(env.sent_at) || Number.isNaN(Date.parse(env.sent_at)))

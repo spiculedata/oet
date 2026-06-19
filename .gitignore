@@ -15,8 +15,17 @@ gcp-key*.json
 
 # Firebase / GCP local
 .firebase/
-firebase-debug.log
 .runtimeconfig.json
+# emulator + tool debug logs and exported emulator data
+*-debug.log
+firebase-export-*/
+.firebase-export/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Editor / OS
 .DS_Store

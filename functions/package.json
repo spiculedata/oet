@@ -15,8 +15,12 @@
   },
   "dependencies": {
     "@google-cloud/bigquery": "^8.3.1",
+    "firebase-admin": "^13.0.0",
     "firebase-functions": "^6.1.0",
     "oet": "file:.."
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
