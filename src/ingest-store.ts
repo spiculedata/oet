@@ -85,6 +85,12 @@ export interface SharedProvisionGateOptions {
   windowMs?: number; // default 1 h
   perIp?: number; // default 5 mints / IP / window
   globalCeiling?: number; // default 1000 mints / window — hard cost cap across all instances
+  /**
+   * Counter-key namespace (default `"pv"`). Use a distinct prefix to run an INDEPENDENT gate budget —
+   * e.g. `"pvc"` for the `GET /provision` challenge endpoint (PW-GET-FLOOD), so challenge-issuance flooding
+   * is bounded separately from (and doesn't consume) the mint ceiling.
+   */
+  keyPrefix?: string;
 }
 
 /**
@@ -102,13 +108,14 @@ export function createSharedProvisionGate(
   const windowMs = opts.windowMs ?? 60 * 60 * 1000;
   const perIp = opts.perIp ?? 5;
   const ceiling = opts.globalCeiling ?? 1000;
+  const p = opts.keyPrefix ?? "pv";
   return {
     async allow(ip) {
       const w = Math.floor(opts.now() / windowMs) * windowMs;
       try {
         const [g, i] = await Promise.all([
-          store.increment(`pv:global:${w}`, windowMs),
-          store.increment(`pv:ip:${ip ?? "?"}:${w}`, windowMs),
+          store.increment(`${p}:global:${w}`, windowMs),
+          store.increment(`${p}:ip:${ip ?? "?"}:${w}`, windowMs),
         ]);
         return g <= ceiling && i <= perIp;
       } catch {

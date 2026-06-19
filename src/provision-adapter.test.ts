@@ -48,6 +48,20 @@ describe("createProvisionHttpHandler — HTTP mapping", () => {
     expect(typeof body.key).toBe("string");
   });
 
+  it("PW: parses {challenge, sig, nonce} from the body into the PoW solution passed to the core", async () => {
+    const verifyProofOfWork = vi.fn(() => ({ ok: true as const, challengeId: "cid1", difficulty: 20 }));
+    const h = createProvisionHttpHandler(deps({ verifyProofOfWork, consumeChallenge: () => true }));
+    const r = await h(http(JSON.stringify({ challenge: "cid1.9.20", sig: "sig", nonce: "nn" }), { "x-firebase-appcheck": "tok" }));
+    expect(r.status).toBe(201);
+    expect(verifyProofOfWork).toHaveBeenCalledWith({ challenge: "cid1.9.20", sig: "sig", nonce: "nn" });
+  });
+
+  it("PW: a body with no solution under a PoW-required handler → 401 (proof_required, opaque)", async () => {
+    const h = createProvisionHttpHandler(deps({ verifyProofOfWork: () => ({ ok: true, challengeId: "c", difficulty: 1 }) }));
+    const r = await h(http("{}", { "x-firebase-appcheck": "tok" }));
+    expect(r.status).toBe(401);
+  });
+
   it("lifts the attestation token from the x-firebase-appcheck header into the core", async () => {
     const verifyAttestation = vi.fn(() => true);
     const h = createProvisionHttpHandler(deps({ verifyAttestation }));
@@ -131,5 +145,15 @@ describe("createSharedProvisionGate (RP4 — cross-instance mint ceiling, fail c
     store.fail = true;
     const gate = createSharedProvisionGate(store, { now: () => 0 });
     expect(await gate.allow("1.1.1.1")).toBe(false);
+  });
+
+  it("PW-GET-FLOOD: a distinct keyPrefix gives an INDEPENDENT budget (challenge gate ≠ mint gate)", async () => {
+    const store = fakeStore();
+    const mint = createSharedProvisionGate(store, { now: () => 0, perIp: 1, keyPrefix: "pv" });
+    const challenge = createSharedProvisionGate(store, { now: () => 0, perIp: 1, keyPrefix: "pvc" });
+    expect(await mint.allow("1.1.1.1")).toBe(true);
+    expect(await mint.allow("1.1.1.1")).toBe(false); // mint budget spent
+    expect(await challenge.allow("1.1.1.1")).toBe(true); // challenge budget untouched by the mint gate
+    expect(await challenge.allow("1.1.1.1")).toBe(false); // then its own budget is enforced
   });
 });

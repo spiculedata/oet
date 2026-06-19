@@ -90,9 +90,16 @@ firebase functions:delete oet:ingest --region us-central1
 - **Geo (GL2)**: country-only geo is derived from a **trusted edge header** — set `OET_COUNTRY_HEADER` to the
   header your LB/Cloud Armor injects (e.g. the Cloud CDN/Armor geo header). Raw IP is never used for geo (it
   stays at the edge). Unset ⇒ `geo` is null (gaps stay gaps). Region stays off (k-anon).
-- **App Check (GL2)**: real `firebase-admin` `getAppCheck().verifyToken` is wired but **OFF by default**. Once
-  App Check is configured in the Firebase project, set `OET_APP_CHECK_ENABLED=true` to verify the
+- **App Check (GL2 + A1/F4)**: real `firebase-admin` `getAppCheck().verifyToken` is wired but **OFF by
+  default**. Once App Check is configured, set `OET_APP_CHECK_ENABLED=true` to verify the
   `x-firebase-appcheck` header (fail-closed). While off, a stray App-Check header is ignored and HMAC runs (F10).
+  **A1/F4 (audit #2) closes the prior App-Check replay hole:** the ingest core now applies the §5.4 `sent_at`
+  freshness window AND a replay nonce to the App-Check path too (nonce = the token), and the verifier uses
+  `verifyToken(token, {consume:true})`. **Client contract when enabling:** clients MUST send a **fresh
+  limited-use** App Check token per request (`getLimitedUseToken()`), since each token verifies/mints once;
+  a reused token → 401. Enable App Check **token replay protection** at deploy:
+  `gcloud services enable firebaseappcheck.googleapis.com`. With this, `OET_APP_CHECK_ENABLED=true` is
+  SEC-unblocked (F4 was the only hold).
 - **Rate limiter / replay cache** are now backed by the **shared Firestore store** (`functions/src/firestore-store.ts`)
   — atomic `claim`/transaction, correct + race-free across instances (D-STORE / D-STORE-CAS), so the function
   runs at `maxInstances: 10`. Needs the Firestore database + TTL policies from step 3b.
@@ -147,6 +154,39 @@ gcloud secrets add-iam-policy-binding "oet-client-<client_id>" \
 > **KS-OUTAGE (done):** the reader distinguishes NOT_FOUND (→ 401 bad-key, negative-cached) from a
 > transient Secret-Manager fault (→ retryable 503, NOT cached), so a blip can't lock out a legit install.
 
+### Derived-key model (A3 / DK1–DK4) — one root key, no per-install secret
+For a **mass** client, storing one secret per install doesn't scale. The derived model (SEC-ratified)
+computes each install's key as `HKDF-SHA256(rootKey, salt, "oet-client-key:<ver>:<client_id>")` — **nothing
+per-install is stored**; the verifier re-derives. **DK4 — pick ONE model per deploy:**
+```
+OET_PER_INSTALL_KEYS=1
+OET_KEY_MODEL=derived            # vs the default "secret" (Secret-Manager-per-install above)
+OET_DERIVED_KEY_VERSION=v1       # DK3 rotation lever
+```
+- **DK1 — root key** (crown-jewel; its compromise = every install's key): a ≥256-bit CSPRNG value in
+  Secret Manager `OET_DERIVED_ROOT_KEY`, readable by the **verifier SA only**, never logged/in-client,
+  **KMS/HSM-backed preferred**. `firebase functions:secrets:set OET_DERIVED_ROOT_KEY` (paste 32+ random
+  bytes). It is bound to the function only when `OET_KEY_MODEL=derived`.
+- **DK2 — revocation deny-list** (you can't delete a derived key): revoke an install by adding a doc
+  `oet_revoked/<sha256(client_id)>` in Firestore → the verifier treats it as keyless (401). Fail-closed: a
+  Firestore fault → retryable 503 (never a silent accept). Cached ~1 min, so revoke takes effect within it.
+  ```
+  # revoke (compute the doc id from the client_id):
+  ID=$(printf %s "<client_id>" | sha256sum | cut -d' ' -f1)
+  gcloud firestore documents create "projects/oet-telemetry/databases/(default)/documents/oet_revoked/$ID" || true
+  ```
+- **DK3 — rotation:** bump `OET_DERIVED_KEY_VERSION` + set a new `OET_DERIVED_ROOT_KEY` → ALL derived keys
+  change at once (coarse; every install must re-provision). A per-cohort `keyVersion` (e.g. per release
+  channel) is the refinement to rotate one cohort without resigning everyone.
+- **Provision side (derived):** with `OET_KEY_MODEL=derived`, `POST /provision` issues a fresh `client_id`
+  and returns its **derived** key (`deriveClientKey`) — **no `createSecret`, nothing stored** (the verifier
+  re-derives), so A8's orphan case can't arise and there's no create-if-absent collision loop (128-bit
+  random id; SEC-accepted). The provision function must use the **same** `OET_KEY_MODEL` + root key +
+  `OET_DERIVED_KEY_VERSION` as the verifier, else minted keys won't verify. (`OET_DERIVED_ROOT_KEY` is bound
+  to the provision function only in derived mode.)
+- ⛔ **Binding:** DK1–DK4 + the derived provision side return to the **SEC gate** before derived keys go
+  live. Until then keep `OET_KEY_MODEL=secret` (or per-install OFF).
+
 ## `POST /provision` — automated first-run key minting (RP1–RP6)
 For a *mass/shipped* untrusted client, the manual `gcloud` provisioning above doesn't scale — the client
 must obtain its per-install key on first run. The `provision` function does this. It is **OFF by default
@@ -159,6 +199,35 @@ Flow: `POST /provision` with a Firebase **App Check** token header → size-cap 
 **replay-consumed** so one token mints once) → per-IP + global **mint ceiling** (shared store, fail-closed)
 → **atomic** `createSecret oet-client-<random>` + first version → `201 {client_id, key}` **once**. Unknown
 attestation → 401; ceiling hit → 429; Secret-Manager blip → 503 (retryable). The key is never logged.
+
+### Desktop proof-of-work (A4 / PW1–PW4)
+App Check is weak on desktop, so a **proof-of-work** raises the cost of scripted minting. Enable:
+```
+OET_POW_ENABLED=1
+OET_POW_DIFFICULTY=20                       # leading-zero bits; ~sub-second for one legit first run
+firebase functions:secrets:set OET_PROVISION_POW_KEY   # random key that signs challenges
+```
+Then the flow is: **`GET /provision`** (App-Check header) → `{challenge, sig, difficulty, exp}` (stateless,
+HMAC-signed, ~2-min TTL) → client solves `SHA-256(challenge:nonce)` to `difficulty` leading-zero bits →
+**`POST /provision`** with `{challenge, sig, nonce}` + the App-Check token. The server verifies PoW
+**after** attestation + the mint ceiling (PW4), then **consumes the challenge id** in the shared store
+(PW2 — one solved challenge mints once). Difficulty is sig-authenticated (no client downgrade); the mint
+ceiling stays the **hard** cap.
+`GET /provision` is itself rate-limited by a **separate** per-IP/global gate (`pvc:` prefix, fail-closed) so
+challenge requests can't flood App-Check verifies/Firestore (PW-GET-FLOOD) — independent of the mint ceiling.
+
+### Steam entitlement (A4 — required on the Steam channel)
+On Steam, the Owner requires a **proof of ownership** on top of PoW. Enable:
+```
+OET_STEAM_ENTITLEMENT_REQUIRED=1
+OET_STEAM_APP_ID=<your-steam-appid>
+firebase functions:secrets:set STEAM_WEB_API_KEY     # the Steam **publisher** Web API key
+```
+The client sends its Steam **session ticket** in the `x-oet-entitlement` header. The server (never the
+client) validates it: `ISteamUserAuth/AuthenticateUserTicket` → `steamid`, then `ISteamUser/CheckAppOwnership`
+→ `ownsapp`. **Fail-closed** — a missing/forged ticket or any Steam-API error → 401; **no client-trusted
+flag**; the publisher Web API key is never logged. Layered after PoW (it makes an external call, so it runs
+last, before the challenge is consumed).
 
 **Least-priv IAM (RP5)** — the provisioner needs **create** rights, a SEPARATE, broader grant than the
 ingest reader's `secretAccessor`. Scope it to the `oet-client-*` namespace (do NOT grant project-wide):
@@ -180,3 +249,14 @@ true per-device cap and a self-serve rotation endpoint are follow-ups.
 > gate**. RP1 (CSPRNG), RP2 (atomic create), RP3 (App Check + consume-replay), RP4 (shared-store ceiling)
 > are in code; RP5 (HTTPS+least-priv IAM) and the App Check replay API are the deploy steps here; RP6
 > (per-device cap + rotation flow) is partially deferred. Keep `invoker: private` until SEC signs off.
+
+**Orphaned-secret sweep (A8, audit #2).** If `addSecretVersion` fails right after `createSecret`, the
+provisioner best-effort **deletes** the just-created versionless secret; a versionless secret is inert
+(the ingest reader treats "no version" as unprovisioned → fail-closed). As a backstop, periodically reap
+any versionless `oet-client-*` secrets:
+```
+for s in $(gcloud secrets list --filter="name~oet-client-" --format="value(name)" --project=oet-telemetry); do
+  vers=$(gcloud secrets versions list "$s" --format="value(name)" --project=oet-telemetry | wc -l)
+  if [ "$vers" -eq 0 ]; then gcloud secrets delete "$s" --quiet --project=oet-telemetry; fi
+done
+```

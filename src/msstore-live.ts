@@ -20,6 +20,20 @@ export type FetchJson = (
   init: { method: string; headers: Record<string, string>; body?: string },
 ) => Promise<{ status: number; json: () => Promise<unknown> }>;
 
+// ── I1 (audit #2): Azure config shape validation (defense-in-depth on the OAuth URL) ──────────────────
+// The tenant is interpolated into `https://login.microsoftonline.com/<tenant>/oauth2/token`. A malformed
+// tenant could distort that URL (extra path segments / scheme), so we shape-check it (and the client id)
+// before any token call. A valid tenant is a GUID or an Entra domain (e.g. `contoso.onmicrosoft.com`);
+// a client id is a GUID-like token. Neither may contain `/`, `:`, whitespace, or other URL metacharacters.
+/** True if `s` is a safe Azure AD **tenant** id (GUID or domain) — no URL-structural characters. */
+export function isValidAzureTenant(s: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9.-]{0,126}$/.test(s);
+}
+/** True if `s` is a safe Azure AD **client** id (GUID-like) — no URL-structural characters. */
+export function isValidAzureClientId(s: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(s);
+}
+
 export interface AzureAdConfig {
   /** Azure AD v1 token endpoint, e.g. `https://login.microsoftonline.com/<tenant>/oauth2/token`. */
   tokenEndpoint: string;

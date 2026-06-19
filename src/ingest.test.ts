@@ -92,6 +92,32 @@ describe("handleIngest — authenticity (C5) fails closed", () => {
     );
     expect(r.status).toBe(401);
   });
+
+  // A1/F4 (SEC audit #2): the App-Check path now gets the SAME §5.4 freshness + replay nonce as HMAC.
+  it("A1/F4: App-Check path records a token-keyed nonce (replay protection on both paths)", async () => {
+    const checkAndRecord = vi.fn(() => true);
+    const r = await handleIngest(
+      req(validEnvelope, { appCheckToken: "tok-xyz" }),
+      makeDeps({ verifyAppCheck: () => true, replayCache: { checkAndRecord } }),
+    );
+    expect(r.status).toBe(202);
+    expect(checkAndRecord).toHaveBeenCalledWith("ac:tok-xyz", Date.parse(validEnvelope.sent_at) + PAST_WINDOW_MS);
+  });
+  it("A1/F4: a replayed App-Check envelope (nonce seen) → 401", async () => {
+    const r = await handleIngest(
+      req(validEnvelope, { appCheckToken: "tok" }),
+      makeDeps({ verifyAppCheck: () => true, replayCache: { checkAndRecord: () => false } }),
+    );
+    expect(r.status).toBe(401);
+  });
+  it("A1/F4: stale/future sent_at on the App-Check path → 401; missing → 400 (fail closed)", async () => {
+    const ac = { appCheckToken: "tok" };
+    const stale = { ...validEnvelope, sent_at: new Date(NOW_MS - (PAST_WINDOW_MS + 60_000)).toISOString() };
+    const future = { ...validEnvelope, sent_at: new Date(NOW_MS + (FUTURE_SKEW_MS + 60_000)).toISOString() };
+    expect((await handleIngest(req(stale, ac), makeDeps({ verifyAppCheck: () => true }))).status).toBe(401);
+    expect((await handleIngest(req(future, ac), makeDeps({ verifyAppCheck: () => true }))).status).toBe(401);
+    expect((await handleIngest(req({ ...validEnvelope, sent_at: undefined }, ac), makeDeps({ verifyAppCheck: () => true }))).status).toBe(400);
+  });
 });
 
 describe("handleIngest — KS-OUTAGE (transient key-store fault ≠ auth failure)", () => {
@@ -140,7 +166,7 @@ describe("handleIngest — replay nonce cache (SEC Q3 / D-STORE-CAS)", () => {
     const checkAndRecord = vi.fn(() => true);
     const r = await handleIngest(req(validEnvelope), makeDeps({ replayCache: { checkAndRecord } }));
     expect(r.status).toBe(202);
-    expect(checkAndRecord).toHaveBeenCalledWith("hmac-sha256:abc", Date.parse(validEnvelope.sent_at) + PAST_WINDOW_MS);
+    expect(checkAndRecord).toHaveBeenCalledWith("sig:hmac-sha256:abc", Date.parse(validEnvelope.sent_at) + PAST_WINDOW_MS);
   });
 });
 

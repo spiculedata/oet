@@ -18,6 +18,8 @@ import {
   createMsStoreAcquisitionSource,
   runAcquisitionPull,
   makeBqInsert,
+  isValidAzureTenant,
+  isValidAzureClientId,
   type FetchJson,
 } from "oet";
 
@@ -51,9 +53,15 @@ export const msstoreAcquisitionsPull = onSchedule(
       log("skipped: Azure AD tenant / client id / productId not configured (Owner setup pending)");
       return;
     }
+    // I1 (audit #2): reject a malformed tenant/client id BEFORE building the OAuth URL (defense-in-depth
+    // against URL-structural injection). Skip the run rather than call a distorted endpoint.
+    if (!isValidAzureTenant(TENANT) || !isValidAzureClientId(CLIENT_ID)) {
+      log("skipped: OET_AZURE_TENANT / OET_AZURE_CLIENT_ID has an invalid shape (check config)");
+      return;
+    }
     const getToken = createAzureAdTokenIssuer(
       {
-        tokenEndpoint: `https://login.microsoftonline.com/${TENANT}/oauth2/token`,
+        tokenEndpoint: `https://login.microsoftonline.com/${encodeURIComponent(TENANT)}/oauth2/token`,
         clientId: CLIENT_ID,
         getClientSecret: async () => AZURE_AD_CLIENT_SECRET.value(),
         resource: "https://manage.devcenter.microsoft.com",

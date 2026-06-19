@@ -9,6 +9,7 @@ import {
   MAX_PROVISION_BODY_BYTES,
   type ProvisionDeps,
 } from "./provision.js";
+import type { PowSolution } from "./provision-pow.js";
 import { CLIENT_ID_KEY_PATTERN } from "./ingest-adapter.js";
 import type { RawHttpRequest, HttpResult } from "./ingest-adapter.js";
 
@@ -30,10 +31,26 @@ export const PROVISION_CLIENT_ID_PATTERN = CLIENT_ID_KEY_PATTERN;
 export interface ProvisionAdapterDeps extends ProvisionDeps {
   /** Header carrying the attestation (App Check) token (default `x-firebase-appcheck`). */
   attestationHeader?: string;
+  /** Header carrying the Steam ownership/session token (default `x-oet-entitlement`). */
+  entitlementHeader?: string;
 }
 
 function jsonResult(status: number, body: unknown, extra: Record<string, string> = {}): HttpResult {
   return { status, headers: { "content-type": "application/json", ...extra }, body: JSON.stringify(body) };
+}
+
+/** Parse a `{challenge, sig, nonce}` PoW solution from the JSON body; undefined if absent/malformed. */
+function parsePow(rawBody: string): PowSolution | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const { challenge, sig, nonce } = parsed as Record<string, unknown>;
+  if (typeof challenge !== "string" || typeof sig !== "string" || typeof nonce !== "string") return undefined;
+  return { challenge, sig, nonce };
 }
 
 /**
@@ -44,11 +61,16 @@ function jsonResult(status: number, body: unknown, extra: Record<string, string>
  */
 export function createProvisionHttpHandler(deps: ProvisionAdapterDeps) {
   const header = deps.attestationHeader ?? "x-firebase-appcheck";
+  const entHeader = deps.entitlementHeader ?? "x-oet-entitlement";
   return async (httpReq: RawHttpRequest): Promise<HttpResult> => {
     if (Buffer.byteLength(httpReq.rawBody, "utf8") > MAX_PROVISION_BODY_BYTES) {
       return jsonResult(413, { error: "payload_too_large" });
     }
     const token = httpReq.headers[header];
+    const entitlementToken = httpReq.headers[entHeader];
+    // A4 / PW — lift a solved challenge {challenge, sig, nonce} out of the JSON body (PoW mode). A
+    // malformed body just means "no pow"; handleProvision rejects (proof_required) when PoW is configured.
+    const pow = parsePow(httpReq.rawBody);
     let res;
     try {
       res = await handleProvision(
@@ -56,6 +78,8 @@ export function createProvisionHttpHandler(deps: ProvisionAdapterDeps) {
           rawBody: httpReq.rawBody,
           ...(httpReq.ip !== undefined ? { ip: httpReq.ip } : {}),
           ...(token !== undefined ? { attestationToken: token } : {}),
+          ...(entitlementToken !== undefined ? { entitlementToken } : {}),
+          ...(pow !== undefined ? { pow } : {}),
         },
         deps,
       );

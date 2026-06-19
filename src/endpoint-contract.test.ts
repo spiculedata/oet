@@ -8,12 +8,12 @@
  *     no replay-nonce record (a forged sig must not be able to poison the cache / pre-block a victim's sig);
  *   · consent opacity is TOTAL — a no-consent request with a malformed body must still return the exact
  *     same opaque 202 as a well-formed one, so shape errors can't be used to probe consent state;
- *   · the App Check path does not consult the body-sig replay cache (pins SEC AD3 for the 4c adapter).
+ *   · the App Check path now enforces §5.4 freshness + a token-keyed replay nonce too (A1/F4, audit #2).
  *
  * Mirrors DEV's mock-deps harness so the two suites stay comparable.
  */
 import { describe, it, expect, vi } from "vitest";
-import { handleIngest, type IngestDeps, type IngestRequest } from "./ingest.js";
+import { handleIngest, PAST_WINDOW_MS, FUTURE_SKEW_MS, type IngestDeps, type IngestRequest } from "./ingest.js";
 import { DEFAULT_ALLOWLIST } from "./index.js";
 
 const NOW_MS = 1_700_000_000_000;
@@ -93,16 +93,39 @@ describe("endpoint — consent opacity is total (C4/D1)", () => {
   });
 });
 
-describe("endpoint — App Check path & the replay-nonce gap (SEC AD3)", () => {
-  it("[AD3] the App Check path does NOT consult the body-sig replay cache (adapter must add its own)", async () => {
+describe("endpoint — App Check path freshness + nonce (A1/F4 — SEC audit #2)", () => {
+  it("[A1/F4] the App Check path NOW records a replay nonce keyed on the token (gap closed)", async () => {
     const checkAndRecord = vi.fn(() => true);
     const r = await handleIngest(
       req(validEnvelope, { appCheckToken: "tok" }),
       makeDeps({ verifyAppCheck: () => true, replayCache: { checkAndRecord } }),
     );
     expect(r.status).toBe(202);
-    // Documents the gap SEC flagged for 4c: App Check has no body nonce, so this path is replay-checked
-    // only by whatever the adapter adds (AD3) — not here.
-    expect(checkAndRecord).not.toHaveBeenCalled();
+    // The fix: App Check is now replay-protected in the CORE — the nonce is the App Check token itself,
+    // expiry anchored to sent_at + PAST_WINDOW (one token ⇒ one envelope in the fresh band).
+    expect(checkAndRecord).toHaveBeenCalledWith("ac:tok", Date.parse(validEnvelope.sent_at) + PAST_WINDOW_MS);
+  });
+
+  it("[A1/F4] a replayed App Check envelope (nonce already seen) → 401", async () => {
+    const r = await handleIngest(
+      req(validEnvelope, { appCheckToken: "tok" }),
+      makeDeps({ verifyAppCheck: () => true, replayCache: { checkAndRecord: () => false } }),
+    );
+    expect(r.status).toBe(401);
+  });
+
+  it("[A1/F4] a stale / future sent_at on the App Check path → 401 (freshness now enforced on both paths)", async () => {
+    const stale = { ...validEnvelope, sent_at: new Date(NOW_MS - (PAST_WINDOW_MS + 60_000)).toISOString() };
+    const future = { ...validEnvelope, sent_at: new Date(NOW_MS + (FUTURE_SKEW_MS + 60_000)).toISOString() };
+    expect((await handleIngest(req(stale, { appCheckToken: "tok" }), makeDeps({ verifyAppCheck: () => true }))).status).toBe(401);
+    expect((await handleIngest(req(future, { appCheckToken: "tok" }), makeDeps({ verifyAppCheck: () => true }))).status).toBe(401);
+  });
+
+  it("[A1/F4] a missing sent_at on the App Check path fails CLOSED → 400 (never skipped)", async () => {
+    const r = await handleIngest(
+      req({ ...validEnvelope, sent_at: undefined }, { appCheckToken: "tok" }),
+      makeDeps({ verifyAppCheck: () => true }),
+    );
+    expect(r.status).toBe(400);
   });
 });

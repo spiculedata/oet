@@ -111,11 +111,13 @@ export interface IpRateGate {
  * A PII-FREE structured security event (SEC F5). Carries ONLY the outcome, the HTTP status, and a
  * COARSE reason category — NEVER client_id, user_id, IP, the sig/secret, or any body content. Lets
  * ops alert on auth-failure / flood / replay spikes without the telemetry endpoint itself logging PII.
+ * `"minted"` (A2) is the credential-issuance audit trail — a successful `/provision` 201; it likewise
+ * carries no `client_id`/key/ip/token, only that a mint happened.
  */
 export interface SecurityEvent {
-  outcome: "rejected";
+  outcome: "rejected" | "minted";
   status: number;
-  /** Coarse category: size_cap · ip_flood · rate_limited · auth_failed · stale · future · replay. */
+  /** Coarse category: size_cap · ip_flood · rate_limited · auth_failed · stale · future · replay · key_minted. */
   reason: string;
 }
 
@@ -196,11 +198,16 @@ export async function handleIngest(
   }
   const body = parsed as Record<string, unknown>;
 
-  // 3. authenticity — fail CLOSED. App Check if a token is present, else HMAC + replay nonce.
-  let authenticated: boolean;
+  // 3. authenticity — fail CLOSED. App Check if a token is present, else HMAC. Whichever path verifies
+  // sets `nonceKey`: the per-envelope identity that the §5.4 freshness+nonce control (below) records.
+  let nonceKey: string;
   if (req.appCheckToken !== undefined) {
-    authenticated = deps.verifyAppCheck(req.appCheckToken);
-    if (!authenticated) return reject(401, "unauthorized", "auth_failed");
+    if (!deps.verifyAppCheck(req.appCheckToken)) return reject(401, "unauthorized", "auth_failed");
+    // A1/F4 (SEC audit #2): the App-Check path now gets the SAME §5.4 freshness + replay nonce as HMAC.
+    // Its nonce is the App Check token itself → one token can be used for at most one envelope in the
+    // fresh band (consume-token at the nonce layer; the real verifier ALSO consumes it, defence-in-depth).
+    // Without this, an App-Check envelope was replayable for the whole ~1h token life — the F4 hole.
+    nonceKey = `ac:${req.appCheckToken}`;
   } else {
     const sig = body.sig;
     if (typeof sig !== "string") return reject(401, "unauthorized", "auth_failed");
@@ -215,22 +222,24 @@ export async function handleIngest(
       throw err; // anything else is unexpected → bubble to the wrapper's opaque 500
     }
     if (!hmacOk) return reject(401, "unauthorized", "auth_failed");
-    // Replay FRESHNESS (§5.4) + nonce, on the signed `sent_at`. F-FRESH-FAILCLOSED (SEC): a missing/
-    // malformed sent_at FAILS CLOSED here (400) — never skipped. The control must be self-contained:
-    // delegating the missing case to validate's 400 would become a live replay hole if a v0.1↔v0.1.1
-    // transition mode relaxed validate's requirement.
-    const sentAtMs = typeof body.sent_at === "string" ? Date.parse(body.sent_at) : NaN;
-    if (Number.isNaN(sentAtMs)) return fail(400, "bad_request");
-    const age = deps.now() - sentAtMs; // +past / −future
-    if (age > PAST_WINDOW_MS || age < -FUTURE_SKEW_MS) {
-      return reject(401, "unauthorized", age > PAST_WINDOW_MS ? "stale" : "future");
-    }
-    // Nonce: one atomic check-and-record. false ⇒ this sig was already seen in the fresh band ⇒ replay.
-    if (!(await deps.replayCache.checkAndRecord(sig, sentAtMs + PAST_WINDOW_MS))) {
-      return reject(401, "unauthorized", "replay");
-    }
-    authenticated = true;
+    nonceKey = `sig:${sig}`;
   }
+
+  // §5.4 replay FRESHNESS + nonce — A1/F4: enforced on BOTH auth paths now. F-FRESH-FAILCLOSED (SEC): a
+  // missing/malformed `sent_at` FAILS CLOSED here (400) — never skipped. The control must be
+  // self-contained: delegating the missing case to validate's 400 would become a live replay hole if a
+  // v0.1↔v0.1.1 transition mode relaxed validate's requirement.
+  const sentAtMs = typeof body.sent_at === "string" ? Date.parse(body.sent_at) : NaN;
+  if (Number.isNaN(sentAtMs)) return fail(400, "bad_request");
+  const age = deps.now() - sentAtMs; // +past / −future
+  if (age > PAST_WINDOW_MS || age < -FUTURE_SKEW_MS) {
+    return reject(401, "unauthorized", age > PAST_WINDOW_MS ? "stale" : "future");
+  }
+  // Nonce: one atomic check-and-record. false ⇒ this key was already seen in the fresh band ⇒ replay.
+  if (!(await deps.replayCache.checkAndRecord(nonceKey, sentAtMs + PAST_WINDOW_MS))) {
+    return reject(401, "unauthorized", "replay");
+  }
+  const authenticated = true;
 
   // 4. C3 — rate limit per client_id + per IP (policy/fail-open-closed lives in the limiter).
   const clientId = typeof body.client_id === "string" ? body.client_id : "";

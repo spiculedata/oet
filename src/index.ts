@@ -53,6 +53,11 @@ export type {
   HttpResult,
   AdapterDeps,
 } from "./ingest-adapter.js";
+export { deriveClientKey, createDerivedKeyStore, createInMemoryRevocationList } from "./derived-key.js";
+export type { RevocationList, DerivedKeyStoreOptions } from "./derived-key.js";
+export { countLeadingZeroBits, powHash, verifyPowSolution, solvePow } from "./pow.js";
+export { issueChallenge, verifyPowChallenge, challengeId } from "./provision-pow.js";
+export type { PowChallenge, PowSolution, PowVerifyResult, ChallengeIssueOptions, PowVerifyOptions } from "./provision-pow.js";
 export { handleProvision, MAX_PROVISION_BODY_BYTES } from "./provision.js";
 export type {
   ProvisionDeps,
@@ -79,8 +84,12 @@ export type {
 export {
   createAzureAdTokenIssuer,
   createMsStoreAcquisitionSource,
+  isValidAzureTenant,
+  isValidAzureClientId,
 } from "./msstore-live.js";
 export type { FetchJson, AzureAdConfig, MsStoreSourceConfig } from "./msstore-live.js";
+export { createSteamEntitlementVerifier } from "./steam-entitlement.js";
+export type { SteamEntitlementConfig } from "./steam-entitlement.js";
 export { createSharedRateLimiter, createSharedReplayCache, createSharedProvisionGate } from "./ingest-store.js";
 export type { SharedStore, SharedRateLimitOptions, SharedProvisionGateOptions } from "./ingest-store.js";
 export { createEmitter, makeHmacSigner } from "./emitter.js";

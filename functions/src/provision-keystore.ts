@@ -51,6 +51,16 @@ export function createSecretManagerKeyProvisioner(
           payload: { data: Buffer.from(key, "utf8") },
         });
       } catch (err) {
+        // A8 (audit #2): adding the first version failed AFTER we created the secret → that secret is now
+        // a versionless orphan. Best-effort delete it so a transient blip doesn't leak empty secrets into
+        // the `oet-client-*` namespace (the retry mints a fresh id). If the cleanup itself fails, the
+        // versionless secret stays inert (no version = unprovisioned) and is caught by the documented
+        // sweep (deploy/RUNBOOK.md). Either way we surface the transient fault as a retryable 503.
+        try {
+          await client.deleteSecret({ name: `${parent}/secrets/${secretId}` });
+        } catch {
+          // swallow — cleanup is best-effort; the orphan is inert and reaped by the sweep.
+        }
         throw new KeyStoreUnavailableError(`secret_manager_addversion_unavailable:${(err as { code?: number }).code ?? "unknown"}`);
       }
       return "created";

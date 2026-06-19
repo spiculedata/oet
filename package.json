@@ -1,6 +1,6 @@
 {
   "name": "oet",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "OET — Open Event Telemetry: a platform-agnostic event envelope that POSTs to one ingestion endpoint and lands GA4-shaped in BigQuery.",
   "license": "Apache-2.0",
   "type": "module",

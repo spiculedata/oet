@@ -2,9 +2,29 @@ import { describe, it, expect, vi } from "vitest";
 import {
   createAzureAdTokenIssuer,
   createMsStoreAcquisitionSource,
+  isValidAzureTenant,
+  isValidAzureClientId,
   type FetchJson,
 } from "./msstore-live.js";
 import { runAcquisitionPull } from "./msstore-puller.js";
+
+describe("I1 (audit #2) — Azure config shape validation", () => {
+  it("accepts a GUID and an Entra domain tenant", () => {
+    expect(isValidAzureTenant("72f988bf-86f1-41af-91ab-2d7cd011db47")).toBe(true);
+    expect(isValidAzureTenant("contoso.onmicrosoft.com")).toBe(true);
+  });
+  it("accepts a GUID-like client id", () => {
+    expect(isValidAzureClientId("11112222-3333-4444-5555-666677778888")).toBe(true);
+  });
+  it("REJECTS tenant/client ids with URL-structural characters (no OAuth-URL injection)", () => {
+    for (const bad of ["a/../evil", "x/oauth2/token", "ten ant", "te:nant", "", "a/b", "https://evil"]) {
+      expect(isValidAzureTenant(bad), `tenant ${bad}`).toBe(false);
+    }
+    for (const bad of ["id/with/slash", "id with space", "id:colon", "", "a/b"]) {
+      expect(isValidAzureClientId(bad), `client ${bad}`).toBe(false);
+    }
+  });
+});
 
 /** Build a FetchJson stub from a (url, init) → { status, body } handler. */
 function stub(handler: (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => { status: number; body: unknown }): { fetchJson: FetchJson; calls: { url: string; init: { method: string; headers: Record<string, string>; body?: string } }[] } {
