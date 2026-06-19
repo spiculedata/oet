@@ -10,6 +10,7 @@
  */
 
 import type { RateLimiter, ReplayCache } from "./ingest.js";
+import type { ProvisionGate } from "./provision.js";
 
 /**
  * The minimal atomic operations a shared store must provide. A Firestore adapter implements
@@ -76,5 +77,43 @@ export function createSharedRateLimiter(
 export function createSharedReplayCache(store: SharedStore): ReplayCache {
   return {
     checkAndRecord: (sig, expiresAtMs) => store.claim(`nonce:${sig}`, expiresAtMs),
+  };
+}
+
+export interface SharedProvisionGateOptions {
+  now: () => number;
+  windowMs?: number; // default 1 h
+  perIp?: number; // default 5 mints / IP / window
+  globalCeiling?: number; // default 1000 mints / window — hard cost cap across all instances
+}
+
+/**
+ * RP4 — the `/provision` mint ceiling over the SHARED counter store, so every instance enforces ONE
+ * budget (an attacker can't fan out across instances to multiply their mints). Per-IP AND a global
+ * ceiling, fixed-window (the window is in the key; each slot self-expires). Unlike the ingest limiter
+ * this **fails CLOSED on a store outage** — minting writes to a paid store and is never load-bearing for
+ * real telemetry, so when the gate can't be evaluated we simply don't mint (deny). Defaults are
+ * deliberately tight: provisioning is a rare first-run event, not steady traffic.
+ */
+export function createSharedProvisionGate(
+  store: SharedStore,
+  opts: SharedProvisionGateOptions,
+): ProvisionGate {
+  const windowMs = opts.windowMs ?? 60 * 60 * 1000;
+  const perIp = opts.perIp ?? 5;
+  const ceiling = opts.globalCeiling ?? 1000;
+  return {
+    async allow(ip) {
+      const w = Math.floor(opts.now() / windowMs) * windowMs;
+      try {
+        const [g, i] = await Promise.all([
+          store.increment(`pv:global:${w}`, windowMs),
+          store.increment(`pv:ip:${ip ?? "?"}:${w}`, windowMs),
+        ]);
+        return g <= ceiling && i <= perIp;
+      } catch {
+        return false; // store outage → fail CLOSED (never mint on an unverifiable ceiling)
+      }
+    },
   };
 }

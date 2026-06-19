@@ -19,7 +19,7 @@ export type {
   EnrichmentContext,
 } from "./ga4.js";
 export { canonicalize, canonicalEnvelope } from "./canonical.js";
-export { handleIngest, MAX_BODY_BYTES, REPLAY_WINDOW_MS } from "./ingest.js";
+export { handleIngest, MAX_BODY_BYTES, REPLAY_WINDOW_MS, KeyStoreUnavailableError } from "./ingest.js";
 export type {
   IngestDeps,
   IngestRequest,
@@ -31,16 +31,21 @@ export type {
 } from "./ingest.js";
 export {
   makeHmacVerifier,
+  createPerInstallKeyResolver,
+  CLIENT_ID_KEY_PATTERN,
   createInMemoryReplayCache,
   createInMemoryRateLimiter,
   createInMemoryIpRateGate,
   createCoarseGeo,
   makeBqInsert,
   rowInsertId,
+  createAppCheckVerifier,
   createIngestHttpHandler,
 } from "./ingest-adapter.js";
 export type {
   SecretLookup,
+  PerInstallKeyStore,
+  PerInstallKeyOptions,
   RateLimitOptions,
   GeoOptions,
   BqWriter,
@@ -48,6 +53,17 @@ export type {
   HttpResult,
   AdapterDeps,
 } from "./ingest-adapter.js";
+export { handleProvision, MAX_PROVISION_BODY_BYTES } from "./provision.js";
+export type {
+  ProvisionDeps,
+  ProvisionRequest,
+  ProvisionResponse,
+  ProvisionGate,
+  KeyProvisioner,
+  ProvisionPersistResult,
+} from "./provision.js";
+export { createCryptoProvisionGen, createProvisionHttpHandler, PROVISION_CLIENT_ID_PATTERN } from "./provision-adapter.js";
+export type { ProvisionAdapterDeps } from "./provision-adapter.js";
 export {
   normalizeAcquisition,
   normalizeAcquisitions,
@@ -60,8 +76,13 @@ export type {
   PullerDeps,
   PullResult,
 } from "./msstore-puller.js";
-export { createSharedRateLimiter, createSharedReplayCache } from "./ingest-store.js";
-export type { SharedStore, SharedRateLimitOptions } from "./ingest-store.js";
+export {
+  createAzureAdTokenIssuer,
+  createMsStoreAcquisitionSource,
+} from "./msstore-live.js";
+export type { FetchJson, AzureAdConfig, MsStoreSourceConfig } from "./msstore-live.js";
+export { createSharedRateLimiter, createSharedReplayCache, createSharedProvisionGate } from "./ingest-store.js";
+export type { SharedStore, SharedRateLimitOptions, SharedProvisionGateOptions } from "./ingest-store.js";
 export { createEmitter, makeHmacSigner } from "./emitter.js";
 export type {
   Emitter,

@@ -3,17 +3,19 @@ import { createHmac } from "node:crypto";
 import { canonicalEnvelope } from "./canonical.js";
 import {
   makeHmacVerifier,
+  createPerInstallKeyResolver,
   createInMemoryReplayCache,
   createInMemoryRateLimiter,
   createCoarseGeo,
   makeBqInsert,
   rowInsertId,
+  createAppCheckVerifier,
   createIngestHttpHandler,
   type AdapterDeps,
   type BqWriter,
 } from "./ingest-adapter.js";
 import type { Ga4Row } from "./ga4.js";
-import { DEFAULT_ALLOWLIST } from "./index.js";
+import { DEFAULT_ALLOWLIST, KeyStoreUnavailableError } from "./index.js";
 import { REPLAY_WINDOW_MS, MAX_BODY_BYTES } from "./ingest.js";
 
 const SECRET = "test-secret-abc";
@@ -34,23 +36,91 @@ function sign(env: Record<string, unknown>, secret = SECRET) {
 describe("makeHmacVerifier — constant-time HMAC (AD2)", () => {
   const verify = makeHmacVerifier(() => SECRET);
 
-  it("accepts a correctly signed envelope", () => {
-    expect(verify(sign(baseEnv))).toBe(true);
+  it("accepts a correctly signed envelope", async () => {
+    expect(await verify(sign(baseEnv))).toBe(true);
   });
-  it("verifies regardless of key order (canonicalization)", () => {
+  it("verifies regardless of key order (canonicalization)", async () => {
     const reordered = { events: baseEnv.events, consent: true, platform: "windows", app_version: "2.2.0+27", user_id: null, client_id: "win-3f2a" };
-    expect(verify(sign(reordered))).toBe(true);
+    expect(await verify(sign(reordered))).toBe(true);
   });
-  it("rejects a tampered body", () => {
+  it("rejects a tampered body", async () => {
     const signed = sign(baseEnv);
-    expect(verify({ ...signed, client_id: "win-EVIL" })).toBe(false);
+    expect(await verify({ ...signed, client_id: "win-EVIL" })).toBe(false);
   });
-  it("rejects a signature made with the wrong secret", () => {
-    expect(verify(sign(baseEnv, "wrong-secret"))).toBe(false);
+  it("rejects a signature made with the wrong secret", async () => {
+    expect(await verify(sign(baseEnv, "wrong-secret"))).toBe(false);
   });
-  it("fails closed when sig is missing or the secret is unknown", () => {
-    expect(verify(baseEnv)).toBe(false);
-    expect(makeHmacVerifier(() => undefined)(sign(baseEnv))).toBe(false);
+  it("fails closed when sig is missing or the secret is unknown", async () => {
+    expect(await verify(baseEnv)).toBe(false);
+    expect(await makeHmacVerifier(() => undefined)(sign(baseEnv))).toBe(false);
+  });
+  it("awaits an ASYNC secret lookup (per-install keying)", async () => {
+    const asyncVerify = makeHmacVerifier(async (b) => (b.client_id === "win-3f2a" ? SECRET : undefined));
+    expect(await asyncVerify(sign(baseEnv))).toBe(true);
+    expect(await asyncVerify(sign({ ...baseEnv, client_id: "win-other" }))).toBe(false);
+  });
+});
+
+describe("createPerInstallKeyResolver — per-client_id keys + cache (C9 / GL3)", () => {
+  const SECRETS: Record<string, string> = { "win-3f2a": "key-A", "and-9b1c": "key-B" };
+
+  it("resolves DIFFERENT keys per client_id, and end-to-end verifies each install's own signature", async () => {
+    const resolve = createPerInstallKeyResolver({ getKey: async (id) => SECRETS[id] });
+    const verify = makeHmacVerifier(resolve);
+    // each install signs with its OWN key
+    expect(await verify(sign({ ...baseEnv, client_id: "win-3f2a" }, "key-A"))).toBe(true);
+    expect(await verify(sign({ ...baseEnv, client_id: "and-9b1c" }, "key-B"))).toBe(true);
+    // a signature valid for one install must NOT verify for another (no shared global secret)
+    expect(await verify(sign({ ...baseEnv, client_id: "and-9b1c" }, "key-A"))).toBe(false);
+  });
+
+  it("fails closed for an unprovisioned/unknown client_id, and NEGATIVE-caches it (no key-store hammer)", async () => {
+    const getKey = vi.fn(async (id: string) => SECRETS[id]);
+    const resolve = createPerInstallKeyResolver({ getKey }, { now: () => 1000 });
+    expect(await resolve({ client_id: "ghost", sig: "x" })).toBeUndefined();
+    expect(await resolve({ client_id: "ghost", sig: "x" })).toBeUndefined();
+    expect(getKey).toHaveBeenCalledTimes(1); // unknown id resolved once, then served from negative cache
+  });
+
+  it("caches a resolved key within the TTL, then re-resolves after it expires (revocation takes effect)", async () => {
+    let t = 0;
+    const getKey = vi.fn(async (id: string) => SECRETS[id]);
+    const resolve = createPerInstallKeyResolver({ getKey }, { now: () => t, ttlMs: 100 });
+    expect(await resolve({ client_id: "win-3f2a" })).toBe("key-A");
+    t = 50;
+    expect(await resolve({ client_id: "win-3f2a" })).toBe("key-A");
+    expect(getKey).toHaveBeenCalledTimes(1); // served from cache within TTL
+    t = 200; // past TTL
+    delete SECRETS["win-3f2a"]; // install revoked at the store
+    expect(await resolve({ client_id: "win-3f2a" })).toBeUndefined(); // revocation now visible
+    expect(getKey).toHaveBeenCalledTimes(2);
+    SECRETS["win-3f2a"] = "key-A"; // restore for other tests
+  });
+
+  it("REFUSES a malformed client_id without ever calling the key store (no name-injection)", async () => {
+    const getKey = vi.fn(async (id: string) => SECRETS[id]);
+    const resolve = createPerInstallKeyResolver({ getKey });
+    for (const bad of ["", "has space", "../etc", "a/b", "x".repeat(65), 42 as unknown as string, undefined as unknown as string]) {
+      expect(await resolve({ client_id: bad })).toBeUndefined();
+    }
+    expect(getKey).not.toHaveBeenCalled();
+  });
+
+  it("KS-OUTAGE: a TRANSIENT store fault propagates UNCACHED (retried next call, never negative-cached)", async () => {
+    let down = true;
+    const getKey = vi.fn(async (id: string) => {
+      if (down) throw new KeyStoreUnavailableError("secret_manager_unavailable:14");
+      return SECRETS[id];
+    });
+    const resolve = createPerInstallKeyResolver({ getKey }, { now: () => 1000, ttlMs: 100_000 });
+    // during the outage: the fault propagates (NOT swallowed to undefined, NOT cached)
+    await expect(resolve({ client_id: "win-3f2a" })).rejects.toBeInstanceOf(KeyStoreUnavailableError);
+    await expect(resolve({ client_id: "win-3f2a" })).rejects.toBeInstanceOf(KeyStoreUnavailableError);
+    expect(getKey).toHaveBeenCalledTimes(2); // each call retried — a blip is NOT cached for the TTL
+    // recovery: the very next call resolves the real key (no stale negative-cache lingering)
+    down = false;
+    expect(await resolve({ client_id: "win-3f2a" })).toBe("key-A");
+    expect(getKey).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -210,11 +280,35 @@ describe("createIngestHttpHandler — wrapper (AD1/AD3 + mapping)", () => {
     expect(res.status).toBe(202);
   });
 
+  it("GL2 geo: derives country from the trusted header (raw IP never used for geo)", async () => {
+    const bqInsert = vi.fn(async () => {});
+    const handler = createIngestHttpHandler(deps({ bqInsert, trustedCountryHeader: "x-client-country" }));
+    await handler(http(sign(baseEnv), { headers: { "x-client-country": "DE" }, ip: "203.0.113.7" }));
+    expect(bqInsert.mock.calls[0]![0][0].geo).toEqual({ country: "DE", region: null });
+  });
+
+  it("GL2 geo: null when the trusted header is configured but absent (gaps stay gaps)", async () => {
+    const bqInsert = vi.fn(async () => {});
+    const handler = createIngestHttpHandler(deps({ bqInsert, trustedCountryHeader: "x-client-country" }));
+    await handler(http(sign(baseEnv), { ip: "203.0.113.7" }));
+    expect(bqInsert.mock.calls[0]![0][0].geo).toBeNull();
+  });
+
   it("maps 429 with a Retry-After header", async () => {
     const handler = createIngestHttpHandler(deps({ rateLimiter: { allow: () => false } }));
     const res = await handler(http(sign(baseEnv), { ip: "203.0.113.7" }));
     expect(res.status).toBe(429);
     expect(res.headers["retry-after"]).toBe(String(REPLAY_WINDOW_MS / 1000));
+  });
+
+  it("KS-OUTAGE: a transient key-store fault maps to a retryable 503 with Retry-After (not 401, not 500)", async () => {
+    const handler = createIngestHttpHandler(deps({
+      verifyHmac: () => { throw new KeyStoreUnavailableError(); },
+    }));
+    const res = await handler(http(sign(baseEnv), { ip: "203.0.113.7" }));
+    expect(res.status).toBe(503);
+    expect(res.headers["retry-after"]).toBe("5");
+    expect(JSON.parse(res.body)).toEqual({ error: "unavailable" });
   });
 
   it("a write failure surfaces as an opaque 500", async () => {
@@ -229,5 +323,16 @@ describe("createIngestHttpHandler — wrapper (AD1/AD3 + mapping)", () => {
     const signed = sign(baseEnv);
     expect((await handler(http(signed, { ip: "203.0.113.7" }))).status).toBe(202);
     expect((await handler(http(signed, { ip: "203.0.113.7" }))).status).toBe(401); // nonce seen
+  });
+});
+
+describe("createAppCheckVerifier (GL2 — firebase-admin App Check)", () => {
+  it("returns true when the injected verifier resolves", async () => {
+    const verify = createAppCheckVerifier(async () => ({ appId: "1:abc" }));
+    expect(await verify("good-token")).toBe(true);
+  });
+  it("fails CLOSED (false) when the verifier rejects", async () => {
+    const verify = createAppCheckVerifier(async () => { throw new Error("invalid token"); });
+    expect(await verify("bad-token")).toBe(false);
   });
 });

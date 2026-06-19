@@ -43,22 +43,22 @@ function sign(body: Record<string, unknown>, secret: string): string {
 
 describe("AD2 — makeHmacVerifier (constant-time, fail-closed)", () => {
   const verify = makeHmacVerifier(() => SECRET);
-  it("accepts a genuinely-signed body", () => {
-    expect(verify({ ...envelope, sig: sign(envelope, SECRET) })).toBe(true);
+  it("accepts a genuinely-signed body", async () => {
+    expect(await verify({ ...envelope, sig: sign(envelope, SECRET) })).toBe(true);
   });
-  it("rejects a tampered body (signature no longer matches)", () => {
+  it("rejects a tampered body (signature no longer matches)", async () => {
     const sig = sign(envelope, SECRET);
-    expect(verify({ ...envelope, consent: false, sig })).toBe(false);
+    expect(await verify({ ...envelope, consent: false, sig })).toBe(false);
   });
-  it("rejects a signature made with the wrong secret", () => {
-    expect(verify({ ...envelope, sig: sign(envelope, "other") })).toBe(false);
+  it("rejects a signature made with the wrong secret", async () => {
+    expect(await verify({ ...envelope, sig: sign(envelope, "other") })).toBe(false);
   });
-  it("fails CLOSED when no secret resolves", () => {
+  it("fails CLOSED when no secret resolves", async () => {
     const noSecret = makeHmacVerifier(() => undefined);
-    expect(noSecret({ ...envelope, sig: sign(envelope, SECRET) })).toBe(false);
+    expect(await noSecret({ ...envelope, sig: sign(envelope, SECRET) })).toBe(false);
   });
-  it("rejects a missing/non-string sig", () => {
-    expect(verify({ ...envelope })).toBe(false);
+  it("rejects a missing/non-string sig", async () => {
+    expect(await verify({ ...envelope })).toBe(false);
   });
 });
 

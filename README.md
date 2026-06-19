@@ -42,7 +42,45 @@ The destination BigQuery table mirrors GA4's `events_*` schema (`event_params`, 
 - **Pullers** — scheduled functions normalizing 3rd-party acquisition data into the same table.
 - **Unified view** — `UNION ALL` over first-party export + OET table.
 
-## Security (non-negotiable — public write endpoint)
+## Integration modes — pick per consumer
+
+OET can be wired into a project two ways. They are **not mutually exclusive** — choose per consumer based on
+whether it sits *inside* your trust boundary. A trusted backend can use Mode A while untrusted clients of the
+same project use Mode B, both landing in the same table.
+
+### Mode A — direct write *(recommended for trusted/server-side consumers)*
+
+A server-side component that **already holds warehouse credentials** maps events with OET's `toGa4Row` and
+writes **straight to BigQuery**. No public endpoint, no HMAC, no secrets to manage — the component is already
+inside the trust boundary.
+
+```ts
+import { toGa4Row } from "oet";
+const rows = events.map((e) => toGa4Row(envelope, e, { receivedAt, geo }));
+await bigquery.dataset("analytics").table("oet_events").insert(rows);
+```
+
+- **When:** a self-hosted backend, a server-side job, or any service that can be trusted with warehouse access.
+- **Why:** simplest, smallest attack surface, fewest moving parts. Uses only the OET *library* (the row mapper
+  + the BQ schema + the union view) — **no deploy, no auth machinery**.
+
+### Mode B — signed endpoint *(for untrusted / public clients)*
+
+An untrusted client (desktop app, CLI, game build, embedded device — or browser events relayed through your
+own backend) POSTs a **signed `oet.event.v1.1` envelope** to your deployed OET ingestion function, which
+verifies + validates + writes. For browser/UI events, relay through a backend so the signing key **never ships
+to the client**.
+
+```
+client → (signed oet.event.v1.1) → POST /ingest → verify HMAC/App Check → validate → BigQuery
+```
+
+- **When:** you need events from clients outside your trust boundary, browser/UI events, or one shared
+  ingestion pipe across several apps.
+- **Why:** this is the hardened public path — HMAC/App Check authenticity, replay protection, rate limiting,
+  the server-side allowlist (everything in **Security**, below).
+
+## Security (non-negotiable — for the Mode B public write endpoint)
 
 - **Authenticity** — HMAC-signed envelope (constant-time compare) or App Check; fail-closed.
 - **Replay protection** — signed `sent_at` freshness window (asymmetric −5m/+1m) + an **atomic** nonce

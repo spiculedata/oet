@@ -31,20 +31,27 @@ import {
 import type { Ga4Geo, Ga4Row } from "./ga4.js";
 
 // ── AD2: HMAC verification (constant-time) ───────────────────────────────────
-/** Resolve the per-app HMAC secret for a request (real: Secret Manager; tests: a fixture map). */
-export type SecretLookup = (body: Record<string, unknown>) => string | undefined;
+/**
+ * Resolve the HMAC secret for a request (real: Secret Manager; tests: a fixture map). MAY be async
+ * (C9 / GL3): per-install keying resolves a per-`client_id` secret from a key store, which is an
+ * async call. A sync `string | undefined` still satisfies the signature (single-shared-secret mode).
+ */
+export type SecretLookup = (
+  body: Record<string, unknown>,
+) => string | undefined | Promise<string | undefined>;
 
 /**
  * Build the core's `verifyHmac`: recompute `hmac-sha256:<base64(HMAC(secret, canonicalEnvelope))>`
  * and compare to `body.sig` in **constant time**. Fails closed on a missing/short secret or any
  * length mismatch. The secret never leaves this closure and is never logged (AD2 / DOMAIN LAW 7).
+ * `getSecret` may be async (per-install keys) — we `await` it.
  */
 export function makeHmacVerifier(getSecret: SecretLookup): IngestDeps["verifyHmac"] {
-  return (body) => {
+  return async (body) => {
     const sig = body.sig;
     if (typeof sig !== "string") return false;
-    const secret = getSecret(body);
-    if (!secret) return false; // no key → no trust (fail closed)
+    const secret = await getSecret(body);
+    if (!secret) return false; // no key (unknown/unprovisioned client) → no trust (fail closed)
     const expected =
       "hmac-sha256:" +
       createHmac("sha256", secret).update(canonicalEnvelope(body)).digest("base64");
@@ -56,6 +63,76 @@ export function makeHmacVerifier(getSecret: SecretLookup): IngestDeps["verifyHma
     } catch {
       return false;
     }
+  };
+}
+
+// ── C9 / GL3: per-install (per-client_id) keys ───────────────────────────────
+/**
+ * The persistent key store behind per-install keying (real: Secret Manager). `getKey` MUST distinguish
+ * three outcomes (KS-OUTAGE — SEC/QA binding):
+ *   · **found**      → resolve the install's secret string;
+ *   · **not-found**  → resolve `undefined` (unprovisioned/revoked) → the resolver negative-caches it and
+ *                      the request fails closed (401);
+ *   · **transient fault** (outage / network / throttle) → **throw `KeyStoreUnavailableError`** — the
+ *                      resolver does NOT cache it and it surfaces as a retryable 503, so a Secret-Manager
+ *                      blip never locks a legit install out for the cache TTL nor looks like a bad key.
+ * It MUST NOT be called with an unvalidated id — the resolver validates the id shape first (so a hostile
+ * `client_id` can't be turned into a Secret Manager name-injection).
+ */
+export interface PerInstallKeyStore {
+  getKey(clientId: string): Promise<string | undefined>;
+}
+
+/** A provisioned `client_id` must match this exactly — also the safe charset for a derived secret name. */
+export const CLIENT_ID_KEY_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+export interface PerInstallKeyOptions {
+  now?: () => number;
+  /** How long a resolved key (or a negative "unknown" result) is cached. Default 5 min. */
+  ttlMs?: number;
+  /** Cache size cap; oldest-expiring entries are evicted past it. Default 5000. */
+  maxEntries?: number;
+}
+
+/**
+ * A `SecretLookup` that resolves a **per-`client_id`** HMAC secret from a `PerInstallKeyStore`
+ * (C9 / GL3), with an in-memory TTL cache so we don't hit the store on every request. This is what
+ * lets a shipped untrusted client carry a *per-install* key instead of one global secret: compromise
+ * of one install's key reveals nothing about any other's, and an install is revoked by removing its
+ * key from the store (effective within `ttlMs`).
+ *
+ * Fails closed: a `client_id` that is missing, the wrong type, or not of the provisioned shape
+ * (`CLIENT_ID_KEY_PATTERN`) resolves to `undefined` → `makeHmacVerifier` rejects. **Unknown ids are
+ * negative-cached** for `ttlMs` too, so a flood of bogus `client_id`s can't hammer the key store. A
+ * **transient** store fault (`KeyStoreUnavailableError`) is propagated UNCACHED (KS-OUTAGE → retryable 503).
+ */
+export function createPerInstallKeyResolver(
+  store: PerInstallKeyStore,
+  opts: PerInstallKeyOptions = {},
+): SecretLookup {
+  const now = opts.now ?? Date.now;
+  const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
+  const maxEntries = opts.maxEntries ?? 5000;
+  // value === undefined is a cached "unknown" (negative cache); both expire at expiresAtMs.
+  const cache = new Map<string, { value: string | undefined; expiresAtMs: number }>();
+
+  return async (body) => {
+    const clientId = body.client_id;
+    if (typeof clientId !== "string" || !CLIENT_ID_KEY_PATTERN.test(clientId)) {
+      return undefined; // malformed/absent id → never trusted, never sent to the store
+    }
+    const t = now();
+    const hit = cache.get(clientId);
+    if (hit && hit.expiresAtMs > t) return hit.value;
+
+    // A transient fault throws KeyStoreUnavailableError here → it propagates UNCACHED (the cache.set
+    // below is skipped), so the next request retries instead of being stuck on a cached miss (KS-OUTAGE).
+    const value = await store.getKey(clientId);
+    // opportunistic eviction so the cache can't grow unbounded; then cap by clearing if still over.
+    for (const [k, v] of cache) if (v.expiresAtMs <= t) cache.delete(k);
+    if (cache.size >= maxEntries) cache.clear();
+    cache.set(clientId, { value, expiresAtMs: t + ttlMs });
+    return value;
   };
 }
 
@@ -257,6 +334,25 @@ export function makeBqInsert(
   };
 }
 
+// ── GL2: App Check verifier (real: firebase-admin) ───────────────────────────
+/**
+ * Adapt a token verifier (real: firebase-admin `getAppCheck().verifyToken`) to the adapter's
+ * `verifyAppCheckToken`. Returns true on a successful verify, **false on ANY rejection — fail closed**.
+ * The verifier is injected so the core imports no SDK and this is unit-testable with a fake.
+ */
+export function createAppCheckVerifier(
+  verifyToken: (token: string) => Promise<unknown>,
+): (token: string) => Promise<boolean> {
+  return async (token) => {
+    try {
+      await verifyToken(token);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+}
+
 // ── HTTP wrapper ─────────────────────────────────────────────────────────────
 export interface RawHttpRequest {
   headers: Record<string, string | undefined>;
@@ -277,6 +373,12 @@ export interface AdapterDeps extends Omit<IngestDeps, "verifyAppCheck"> {
   verifyAppCheckToken?: (token: string) => boolean | Promise<boolean>;
   /** Header name carrying the App Check token (default `x-firebase-appcheck`). */
   appCheckHeader?: string;
+  /**
+   * GL2 geo: name of a TRUSTED edge-injected country header (your LB / Cloud Armor geo header). When
+   * set, geo is derived from it — **country-only, and the raw IP is never used for geo** (it stays at
+   * the edge, DOMAIN LAW 1). Falls back to `deriveGeo(ip)` when not configured.
+   */
+  trustedCountryHeader?: string;
 }
 
 function jsonResult(status: number, body: unknown, extra: Record<string, string> = {}): HttpResult {
@@ -306,6 +408,12 @@ export function createIngestHttpHandler(deps: AdapterDeps) {
       appCheckResult = await deps.verifyAppCheckToken(token);
     }
 
+    // GL2 geo: prefer a trusted edge-injected country header — country-only, raw IP never used for geo.
+    const headerCountry = deps.trustedCountryHeader ? httpReq.headers[deps.trustedCountryHeader] : undefined;
+    const deriveGeo: IngestDeps["deriveGeo"] = deps.trustedCountryHeader
+      ? () => (headerCountry ? { country: headerCountry, region: null } : null)
+      : deps.deriveGeo;
+
     const coreDeps: IngestDeps = {
       now: deps.now,
       allowlist: deps.allowlist,
@@ -313,7 +421,7 @@ export function createIngestHttpHandler(deps: AdapterDeps) {
       verifyAppCheck: () => appCheckResult, // async pre-verified, injected sync (AD3)
       rateLimiter: deps.rateLimiter,
       replayCache: deps.replayCache,
-      deriveGeo: deps.deriveGeo,
+      deriveGeo,
       bqInsert: deps.bqInsert,
     };
 
@@ -330,7 +438,11 @@ export function createIngestHttpHandler(deps: AdapterDeps) {
       // A write failure (after retries) or unexpected error → opaque 500; never leak detail (§6).
       return jsonResult(500, { error: "internal" });
     }
-    const extra = res.status === 429 ? { "retry-after": String(Math.ceil(REPLAY_WINDOW_MS / 1000)) } : {};
+    // 429 (rate limit) and 503 (KS-OUTAGE — transient key-store fault) are both retryable → Retry-After.
+    const extra =
+      res.status === 429 ? { "retry-after": String(Math.ceil(REPLAY_WINDOW_MS / 1000)) }
+      : res.status === 503 ? { "retry-after": "5" }
+      : {};
     return jsonResult(res.status, res.body, extra);
   };
 }

@@ -4,6 +4,7 @@ import {
   MAX_BODY_BYTES,
   PAST_WINDOW_MS,
   FUTURE_SKEW_MS,
+  KeyStoreUnavailableError,
   type IngestDeps,
   type IngestRequest,
 } from "./ingest.js";
@@ -90,6 +91,42 @@ describe("handleIngest — authenticity (C5) fails closed", () => {
       makeDeps({ verifyAppCheck: () => false }),
     );
     expect(r.status).toBe(401);
+  });
+});
+
+describe("handleIngest — KS-OUTAGE (transient key-store fault ≠ auth failure)", () => {
+  it("503 (not 401) when verifyHmac throws a KeyStoreUnavailableError — retryable, no security event, no state touched", async () => {
+    const onSecurityEvent = vi.fn();
+    const rateLimiter = { allow: vi.fn(() => true) };
+    const checkAndRecord = vi.fn(() => true);
+    const bqInsert = vi.fn();
+    const r = await handleIngest(
+      req(validEnvelope),
+      makeDeps({
+        verifyHmac: () => { throw new KeyStoreUnavailableError(); },
+        onSecurityEvent,
+        rateLimiter,
+        replayCache: { checkAndRecord },
+        bqInsert,
+      }),
+    );
+    expect(r.status).toBe(503); // retryable server fault, NOT a 401 auth rejection
+    expect(r.body).toEqual({ error: "unavailable" });
+    expect(onSecurityEvent).not.toHaveBeenCalled(); // an outage is not a client rejection — not logged as auth
+    expect(rateLimiter.allow).not.toHaveBeenCalled(); // we threw before rate-limit…
+    expect(checkAndRecord).not.toHaveBeenCalled(); // …and before the replay nonce — no state mutated
+    expect(bqInsert).not.toHaveBeenCalled();
+  });
+
+  it("a bad/absent key (verifyHmac returns false) is still a 401 — the two are not conflated", async () => {
+    const r = await handleIngest(req(validEnvelope), makeDeps({ verifyHmac: () => false }));
+    expect(r.status).toBe(401);
+  });
+
+  it("an UNEXPECTED (non-KeyStore) throw from verifyHmac bubbles out (→ wrapper opaque 500), not a 503", async () => {
+    await expect(
+      handleIngest(req(validEnvelope), makeDeps({ verifyHmac: () => { throw new Error("boom"); } })),
+    ).rejects.toThrow("boom");
   });
 });
 

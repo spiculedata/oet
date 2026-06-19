@@ -40,6 +40,30 @@ export const FUTURE_SKEW_MS = 1 * 60 * 1000;
 /** @deprecated kept as an alias of PAST_WINDOW_MS for existing callers. */
 export const REPLAY_WINDOW_MS = PAST_WINDOW_MS;
 
+/**
+ * KS-OUTAGE — thrown by a key store / `verifyHmac` when a per-install key could **not be resolved due
+ * to a TRANSIENT fault** (Secret Manager outage, network blip, throttling) — as distinct from a key
+ * that genuinely does not exist (unprovisioned/revoked → fail-closed 401). The two MUST NOT be
+ * conflated: a transient fault is a server problem (retryable 503), and it must NOT be negative-cached
+ * (else one blip locks a legit install out for the whole cache TTL) nor logged as an auth rejection.
+ * A pure Error subclass — no SDK — so the pure core can `instanceof`-detect it. (`.name` is set so the
+ * check survives bundlers/realms where `instanceof` can be unreliable.)
+ */
+export class KeyStoreUnavailableError extends Error {
+  constructor(message = "key_store_unavailable") {
+    super(message);
+    this.name = "KeyStoreUnavailableError";
+  }
+}
+
+/** True for a transient key-resolution fault (KS-OUTAGE), tolerant of cross-realm/bundler identity. */
+function isKeyStoreUnavailable(err: unknown): boolean {
+  return (
+    err instanceof KeyStoreUnavailableError ||
+    (typeof err === "object" && err !== null && (err as { name?: string }).name === "KeyStoreUnavailableError")
+  );
+}
+
 /** validateEnvelope reasons that map to 400 (vs the opaque 202 "all-dropped" classes). */
 const ENVELOPE_400_REASONS = new Set([
   "malformed_envelope",
@@ -104,8 +128,12 @@ export interface IngestDeps {
   onSecurityEvent?: (event: SecurityEvent) => void;
   /** Permitted event names (§3); unknown names are dropped. */
   allowlist: ReadonlySet<string>;
-  /** Recompute the §5.2 canonical HMAC and constant-time compare against body.sig (adapter owns the secret). */
-  verifyHmac(body: Record<string, unknown>): boolean;
+  /**
+   * Recompute the §5.2 canonical HMAC and constant-time compare against body.sig (adapter owns the
+   * secret). MAY be async (C9 / GL3): per-install keying resolves the per-`client_id` secret from a
+   * key store (Secret Manager), so the core `await`s the result. A sync `boolean` still satisfies it.
+   */
+  verifyHmac(body: Record<string, unknown>): boolean | Promise<boolean>;
   /** Verify a Firebase App Check token (§5.3). */
   verifyAppCheck(token: string): boolean;
   rateLimiter: RateLimiter;
@@ -175,9 +203,18 @@ export async function handleIngest(
     if (!authenticated) return reject(401, "unauthorized", "auth_failed");
   } else {
     const sig = body.sig;
-    if (typeof sig !== "string" || !deps.verifyHmac(body)) {
-      return reject(401, "unauthorized", "auth_failed");
+    if (typeof sig !== "string") return reject(401, "unauthorized", "auth_failed");
+    // KS-OUTAGE: a per-install key store can fail TRANSIENTLY. That is NOT an auth rejection — it must
+    // return a retryable 503 (not a 401), fire NO security event, and touch NO rate-limit/replay state
+    // (we're before those steps). A genuinely-bad/absent key still returns false → 401 below.
+    let hmacOk: boolean;
+    try {
+      hmacOk = await deps.verifyHmac(body);
+    } catch (err) {
+      if (isKeyStoreUnavailable(err)) return fail(503, "unavailable");
+      throw err; // anything else is unexpected → bubble to the wrapper's opaque 500
     }
+    if (!hmacOk) return reject(401, "unauthorized", "auth_failed");
     // Replay FRESHNESS (§5.4) + nonce, on the signed `sent_at`. F-FRESH-FAILCLOSED (SEC): a missing/
     // malformed sent_at FAILS CLOSED here (400) — never skipped. The control must be self-contained:
     // delegating the missing case to validate's 400 would become a live replay hole if a v0.1↔v0.1.1
