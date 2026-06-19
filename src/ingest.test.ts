@@ -1,0 +1,223 @@
+import { describe, it, expect, vi } from "vitest";
+import {
+  handleIngest,
+  MAX_BODY_BYTES,
+  PAST_WINDOW_MS,
+  FUTURE_SKEW_MS,
+  type IngestDeps,
+  type IngestRequest,
+} from "./ingest.js";
+import { DEFAULT_ALLOWLIST } from "./index.js";
+
+const NOW_MS = 1_700_000_000_000;
+
+const validEnvelope = {
+  client_id: "win-3f2a",
+  user_id: null,
+  platform: "windows",
+  app_version: "2.2.0+27",
+  consent: true,
+  sent_at: "2023-11-14T22:13:20.000Z",
+  events: [{ name: "app_open", ts: "2026-06-18T00:00:00Z" }],
+  sig: "hmac-sha256:abc",
+};
+
+function makeDeps(overrides: Partial<IngestDeps> = {}): IngestDeps {
+  return {
+    now: () => NOW_MS,
+    allowlist: DEFAULT_ALLOWLIST,
+    verifyHmac: () => true,
+    verifyAppCheck: () => true,
+    rateLimiter: { allow: () => true },
+    replayCache: { seen: () => false, record: () => {} },
+    deriveGeo: () => ({ country: "US", region: null }),
+    bqInsert: vi.fn(),
+    ...overrides,
+  };
+}
+
+function req(body: unknown, extra: Partial<IngestRequest> = {}): IngestRequest {
+  return { rawBody: JSON.stringify(body), ip: "203.0.113.7", ...extra };
+}
+
+describe("handleIngest — size cap (C2) & parse", () => {
+  it("rejects an oversized body with 413 BEFORE parsing (raw bytes, not JSON)", async () => {
+    const oversized = "x".repeat(MAX_BODY_BYTES + 1); // not even valid JSON
+    const r = await handleIngest({ rawBody: oversized }, makeDeps());
+    expect(r.status).toBe(413); // 413, not 400 → the cap ran before JSON.parse
+  });
+
+  it("rejects invalid JSON with 400", async () => {
+    const r = await handleIngest({ rawBody: "{not json" }, makeDeps());
+    expect(r.status).toBe(400);
+  });
+
+  it("rejects a non-object JSON body (array/scalar) with 400 before auth (EP1)", async () => {
+    const verifyHmac = vi.fn(() => true);
+    for (const raw of ["[]", "123", "null", '"x"']) {
+      const r = await handleIngest({ rawBody: raw }, makeDeps({ verifyHmac }));
+      expect(r.status, `body ${raw}`).toBe(400);
+    }
+    expect(verifyHmac).not.toHaveBeenCalled(); // EP1 precedes authenticity
+  });
+});
+
+describe("handleIngest — authenticity (C5) fails closed", () => {
+  it("401 when HMAC verification fails", async () => {
+    const r = await handleIngest(req(validEnvelope), makeDeps({ verifyHmac: () => false }));
+    expect(r.status).toBe(401);
+  });
+
+  it("401 when neither sig nor App Check token is present", async () => {
+    const noSig = { ...validEnvelope, sig: undefined };
+    const r = await handleIngest(req(noSig), makeDeps());
+    expect(r.status).toBe(401);
+  });
+
+  it("uses App Check when a token is present, bypassing HMAC", async () => {
+    const verifyHmac = vi.fn(() => false); // would 401 if consulted
+    const r = await handleIngest(
+      req(validEnvelope, { appCheckToken: "tok" }),
+      makeDeps({ verifyHmac, verifyAppCheck: () => true }),
+    );
+    expect(r.status).toBe(202);
+    expect(verifyHmac).not.toHaveBeenCalled();
+  });
+
+  it("401 when the App Check token is invalid", async () => {
+    const r = await handleIngest(
+      req(validEnvelope, { appCheckToken: "bad" }),
+      makeDeps({ verifyAppCheck: () => false }),
+    );
+    expect(r.status).toBe(401);
+  });
+});
+
+describe("handleIngest — replay nonce cache (SEC Q3)", () => {
+  it("401 when the signature was already seen in the window", async () => {
+    const r = await handleIngest(req(validEnvelope), makeDeps({ replayCache: { seen: () => true, record: () => {} } }));
+    expect(r.status).toBe(401);
+  });
+
+  it("records the signature on a fresh request, with expiry anchored to sent_at + PAST_WINDOW", async () => {
+    const record = vi.fn();
+    const r = await handleIngest(req(validEnvelope), makeDeps({ replayCache: { seen: () => false, record } }));
+    expect(r.status).toBe(202);
+    expect(record).toHaveBeenCalledWith("hmac-sha256:abc", Date.parse(validEnvelope.sent_at) + PAST_WINDOW_MS);
+  });
+});
+
+describe("handleIngest — replay freshness (§5.4, signed sent_at)", () => {
+  const at = (deltaMs: number) => ({ ...validEnvelope, sent_at: new Date(NOW_MS - deltaMs).toISOString() });
+
+  it("202 for an in-window sent_at (age 0)", async () => {
+    expect((await handleIngest(req(at(0)), makeDeps())).status).toBe(202);
+  });
+  it("202 at the exact PAST_WINDOW edge", async () => {
+    expect((await handleIngest(req(at(PAST_WINDOW_MS)), makeDeps())).status).toBe(202);
+  });
+  it("401 for a STALE sent_at (older than PAST_WINDOW)", async () => {
+    expect((await handleIngest(req(at(PAST_WINDOW_MS + 1000)), makeDeps())).status).toBe(401);
+  });
+  it("401 for a FUTURE sent_at beyond FUTURE_SKEW (forgery/replay signal)", async () => {
+    expect((await handleIngest(req(at(-(FUTURE_SKEW_MS + 1000))), makeDeps())).status).toBe(401);
+  });
+  it("202 within FUTURE_SKEW (small clock-ahead tolerated)", async () => {
+    expect((await handleIngest(req(at(-FUTURE_SKEW_MS)), makeDeps())).status).toBe(202);
+  });
+  it("400 (not 401) when sent_at is MISSING — a malformed envelope, not a stale one", async () => {
+    expect((await handleIngest(req({ ...validEnvelope, sent_at: undefined }), makeDeps())).status).toBe(400);
+  });
+  it("400 when sent_at is present but not ISO-8601", async () => {
+    expect((await handleIngest(req({ ...validEnvelope, sent_at: "yesterday" }), makeDeps())).status).toBe(400);
+  });
+});
+
+describe("handleIngest — rate limit (C3)", () => {
+  it("429 when over limit", async () => {
+    const r = await handleIngest(req(validEnvelope), makeDeps({ rateLimiter: { allow: () => false } }));
+    expect(r.status).toBe(429);
+  });
+
+  it("passes client_id, IP, and the authenticated flag to the limiter", async () => {
+    const allow = vi.fn(() => true);
+    await handleIngest(req(validEnvelope), makeDeps({ rateLimiter: { allow } }));
+    expect(allow).toHaveBeenCalledWith("win-3f2a", "203.0.113.7", true);
+  });
+});
+
+describe("handleIngest — consent opacity (C4 + D1)", () => {
+  it("202 and no write when consent is false", async () => {
+    const bqInsert = vi.fn();
+    const r = await handleIngest(req({ ...validEnvelope, consent: false }), makeDeps({ bqInsert }));
+    expect(r.status).toBe(202);
+    expect(bqInsert).not.toHaveBeenCalled();
+  });
+
+  it("202 (not 400) when consent is ABSENT — indistinguishable from consent:false", async () => {
+    const r = await handleIngest(req({ ...validEnvelope, consent: undefined }), makeDeps());
+    expect(r.status).toBe(202);
+  });
+});
+
+describe("handleIngest — validation mapping", () => {
+  it("400 for a malformed envelope (missing client_id) with consent granted", async () => {
+    const r = await handleIngest(req({ ...validEnvelope, client_id: undefined }), makeDeps());
+    expect(r.status).toBe(400);
+  });
+
+  it("413 for a batch over the cap", async () => {
+    const events = Array.from({ length: 1001 }, () => ({ name: "app_open", ts: "2026-06-18T00:00:00Z" }));
+    const r = await handleIngest(req({ ...validEnvelope, events }), makeDeps());
+    expect(r.status).toBe(413);
+  });
+
+  it("202 (opaque) and no write when EVERY event is dropped by the allowlist", async () => {
+    const bqInsert = vi.fn();
+    const r = await handleIngest(
+      req({ ...validEnvelope, events: [{ name: "spam_evt", ts: "2026-06-18T00:00:00Z" }] }),
+      makeDeps({ bqInsert }),
+    );
+    expect(r.status).toBe(202); // not 400 — can't distinguish allowed from dropped
+    expect(bqInsert).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleIngest — happy path, enrichment & EC2", () => {
+  it("202 and writes GA4 rows with server timestamp + derived geo", async () => {
+    const bqInsert = vi.fn();
+    const r = await handleIngest(req(validEnvelope), makeDeps({ bqInsert }));
+    expect(r.status).toBe(202);
+    expect(r.body).toEqual({ ok: true });
+    expect(bqInsert).toHaveBeenCalledTimes(1);
+    const rows = bqInsert.mock.calls[0]![0];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].event_timestamp).toBe(NOW_MS * 1000); // µs, server-stamped
+    expect(rows[0].geo).toEqual({ country: "US", region: null });
+    expect(rows[0].user_pseudo_id).toBe("win-3f2a");
+  });
+
+  it("EC2: writes ONLY accepted events — dropped ones never become rows", async () => {
+    const bqInsert = vi.fn();
+    await handleIngest(
+      req({
+        ...validEnvelope,
+        events: [
+          { name: "app_open", ts: "2026-06-18T00:00:00Z" },
+          { name: "spam_evt", ts: "2026-06-18T00:00:00Z" }, // not allowlisted → dropped
+          { name: "purchase", ts: "2026-06-18T00:00:01Z" },
+        ],
+      }),
+      makeDeps({ bqInsert }),
+    );
+    const rows = bqInsert.mock.calls[0]![0];
+    expect(rows.map((r: { event_name: string }) => r.event_name)).toEqual(["app_open", "purchase"]);
+  });
+
+  it("does not write when geo is null (no IP / suppressed) but still 202", async () => {
+    const bqInsert = vi.fn();
+    const r = await handleIngest(req(validEnvelope), makeDeps({ bqInsert, deriveGeo: () => null }));
+    expect(r.status).toBe(202);
+    expect(bqInsert.mock.calls[0]![0][0].geo).toBeNull();
+  });
+});

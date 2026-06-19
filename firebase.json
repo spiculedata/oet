@@ -1,0 +1,14 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "oet",
+      "ignore": ["node_modules", ".git", "*.log"],
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR/..\" run build",
+        "npm --prefix \"$RESOURCE_DIR\" install",
+        "npm --prefix \"$RESOURCE_DIR\" run build"
+      ]
+    }
+  ]
+}

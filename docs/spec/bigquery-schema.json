@@ -1,0 +1,41 @@
+[
+  { "name": "event_name", "type": "STRING", "mode": "REQUIRED",
+    "description": "OET events[].name (allowlisted). GA4: event_name." },
+  { "name": "event_timestamp", "type": "INT64", "mode": "REQUIRED",
+    "description": "Server-stamped receive time, microseconds since epoch. GA4: event_timestamp." },
+  { "name": "event_params", "type": "RECORD", "mode": "REPEATED",
+    "description": "Flat key/value params, GA4-shaped. Includes client_ts (the client's advisory ts).",
+    "fields": [
+      { "name": "key", "type": "STRING", "mode": "REQUIRED" },
+      { "name": "value", "type": "RECORD", "mode": "NULLABLE",
+        "fields": [
+          { "name": "string_value", "type": "STRING", "mode": "NULLABLE" },
+          { "name": "int_value", "type": "INT64", "mode": "NULLABLE" },
+          { "name": "double_value", "type": "FLOAT64", "mode": "NULLABLE" },
+          { "name": "bool_value", "type": "BOOL", "mode": "NULLABLE" }
+        ]
+      }
+    ]
+  },
+  { "name": "user_pseudo_id", "type": "STRING", "mode": "REQUIRED",
+    "description": "OET client_id (stable-per-install, PII-free). GA4: user_pseudo_id." },
+  { "name": "user_id", "type": "STRING", "mode": "NULLABLE",
+    "description": "OET user_id (opaque app id; null when anonymous). GA4: user_id." },
+  { "name": "platform", "type": "STRING", "mode": "REQUIRED",
+    "description": "OET platform token. GA4: platform." },
+  { "name": "app_info", "type": "RECORD", "mode": "NULLABLE",
+    "fields": [
+      { "name": "version", "type": "STRING", "mode": "NULLABLE",
+        "description": "OET app_version. GA4: app_info.version." }
+    ]
+  },
+  { "name": "geo", "type": "RECORD", "mode": "NULLABLE",
+    "description": "Coarse geo derived server-side from IP. Raw IP is NEVER stored (DOMAIN LAW 1).",
+    "fields": [
+      { "name": "country", "type": "STRING", "mode": "NULLABLE" },
+      { "name": "region", "type": "STRING", "mode": "NULLABLE" }
+    ]
+  },
+  { "name": "oet_ingest_version", "type": "STRING", "mode": "REQUIRED",
+    "description": "Provenance stamp, e.g. 'oet.event.v1'. Distinguishes OET rows from first-party export." }
+]

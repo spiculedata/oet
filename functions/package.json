@@ -1,0 +1,25 @@
+{
+  "name": "oet-functions",
+  "version": "0.1.0",
+  "description": "OET ingestion endpoint — Firebase Cloud Function deploy wrapper.",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "serve": "firebase emulators:start --only functions"
+  },
+  "dependencies": {
+    "@google-cloud/bigquery": "^8.3.1",
+    "firebase-functions": "^6.1.0",
+    "oet": "file:.."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

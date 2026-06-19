@@ -1,0 +1,14 @@
+{
+  "_comment": "Server-side event allowlist (OET Spec v0.1 §3). Event names NOT in this list are dropped and never written. Per-deployment config; this is a starter mirroring src/index.ts DEFAULT_ALLOWLIST plus generic GA4-recommended example events. Replace with your app's own events.",
+  "version": "oet.event.v1",
+  "allow": [
+    "app_open",
+    "app_close",
+    "session_start",
+    "purchase",
+    "tutorial_complete",
+    "level_up",
+    "store_download",
+    "store_install"
+  ]
+}

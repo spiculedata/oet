@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Env & secrets — NEVER commit (DOMAIN LAW: no secrets, no PII)
+.env
+.env.*
+*.key
+*.pem
+service-account*.json
+gcp-key*.json
+
+# Firebase / GCP local
+.firebase/
+firebase-debug.log
+.runtimeconfig.json
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Test / coverage
+coverage/
